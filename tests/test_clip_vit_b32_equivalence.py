@@ -9,28 +9,29 @@ import pytest
 import torch
 from PIL import Image, ImageDraw
 
-from sarm.model.clip import ViTB32, load_npz_into_model
-from sarm.utils.convert_clip import main as export_vit_b32_weights
+from sarm.model.clip import ViTB32, load_vision_npz
+from sarm.utils.convert_clip import main as export_clip_weights
 
-WEIGHTS_PATH = "checkpoints/vit_b32_openai_weights.npz"
+WEIGHTS_PATH = "checkpoints/clip_vit_b32_openai.npz"
 
 
 @pytest.fixture(scope="session")
-def pt_model_and_preprocess():
+def pt_model_and_preprocess(torch_device):
     # Load PyTorch CLIP ViT-B/32 (openai weights) and its official preprocess
     # Force quick_gelu=True to match the original OpenAI training
     model, _, preprocess = open_clip.create_model_and_transforms(
         "ViT-B-32", pretrained="openai", force_quick_gelu=True
     )
     model.eval()
-    return model, preprocess
+    model.to(torch_device)
+    return model, preprocess, torch_device
 
 
 @pytest.fixture(scope="session")
 def ensure_weights(pt_model_and_preprocess):
     # Export weights once per session if not already present
     if not os.path.exists(WEIGHTS_PATH):
-        export_vit_b32_weights()
+        export_clip_weights()
     assert os.path.exists(WEIGHTS_PATH), "Failed to export CLIP weights to .npz"
     return WEIGHTS_PATH
 
@@ -67,24 +68,24 @@ def _torch_forward_visual(model, imgs_pt):
 
 
 def test_vit_b32_image_features_match_pytorch(pt_model_and_preprocess, ensure_weights):
-    model, preprocess = pt_model_and_preprocess
+    model, preprocess, torch_device = pt_model_and_preprocess
 
     # ----- Build (and load weights into) the Equinox model -----
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
     eq_model = jax.vmap(eq_model)
 
     # ----- Make two test images and preprocess with official transforms -----
     pil_imgs = _make_test_images()
-    imgs_pt = torch.stack(
-        [preprocess(im.convert("RGB")) for im in pil_imgs], dim=0
+    imgs_pt = torch.stack([preprocess(im.convert("RGB")) for im in pil_imgs], dim=0).to(
+        torch_device
     )  # (B,3,224,224)
 
     # ----- PyTorch path -----
     pt_feat = _torch_forward_visual(model, imgs_pt).cpu().numpy()  # (B,512)
 
     # ----- Equinox path -----
-    imgs_np = imgs_pt.numpy()  # (B,3,224,224) already CLIP-normalized
+    imgs_np = imgs_pt.cpu().numpy()  # (B,3,224,224) already CLIP-normalized
     imgs_jax = jnp.asarray(imgs_np)
     eq_feat = np.array(eq_model(imgs_jax))  # (B,512)
 
@@ -107,11 +108,11 @@ def test_vit_b32_image_features_match_pytorch(pt_model_and_preprocess, ensure_we
 
 def test_weight_loading(pt_model_and_preprocess, ensure_weights):
     """Test that weights are loaded correctly from PyTorch to Equinox."""
-    model, _ = pt_model_and_preprocess
+    model, _, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Test MLP weights in first block
     pt_fc1_weight = (
@@ -134,88 +135,96 @@ def test_weight_loading(pt_model_and_preprocess, ensure_weights):
 
 def test_linear_layer_equivalence(pt_model_and_preprocess, ensure_weights):
     """Test that Equinox Linear layers produce the same output as PyTorch."""
-    model, _ = pt_model_and_preprocess
+    model, _, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Create test input
     test_input_np = np.random.randn(50, 768).astype(np.float32)
-    test_input_pt = torch.from_numpy(test_input_np)
+    test_input_pt = torch.from_numpy(test_input_np).to(torch_device)
     test_input_jax = jnp.array(test_input_np)
 
     # Test PyTorch
     with torch.no_grad():
-        pt_output = pt_visual.transformer.resblocks[0].mlp.c_fc(test_input_pt).numpy()
+        pt_output = (
+            pt_visual.transformer.resblocks[0].mlp.c_fc(test_input_pt).cpu().numpy()
+        )
 
     # Test Equinox
     eq_output = np.array(jax.vmap(eq_model.blocks[0].mlp.fc1)(test_input_jax))
 
     # Should match to numerical precision
-    assert np.allclose(pt_output, eq_output, atol=1e-5, rtol=1e-5)
+    assert np.allclose(
+        pt_output, eq_output, atol=1e-5, rtol=1e-5
+    ), f"Mean absolute difference: {np.mean(np.abs(pt_output - eq_output))}, Max absolute difference: {np.max(np.abs(pt_output - eq_output))}"
 
 
 def test_patch_embeddings(pt_model_and_preprocess, ensure_weights):
     """Test that patch embeddings (conv layer) match between PyTorch and Equinox."""
-    model, preprocess = pt_model_and_preprocess
+    model, preprocess, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Create a test image
     img = Image.new("RGB", (224, 224), (128, 128, 128))
-    img_pt = preprocess(img).unsqueeze(0)
-    img_jax = jnp.array(img_pt.numpy())
+    img_pt = preprocess(img).unsqueeze(0).to(torch_device)
+    img_jax = jnp.array(img_pt.cpu().numpy())
 
     # PyTorch patch embedding
     with torch.no_grad():
-        pt_patches = pt_visual.conv1(img_pt).numpy()  # (1, 768, 7, 7)
+        pt_patches = pt_visual.conv1(img_pt).cpu().numpy()  # (1, 768, 7, 7)
 
     # Equinox patch embedding
     eq_patches = np.array(eq_model.patch(img_jax[0]))  # (768, 7, 7)
 
     # Should match very closely (minor floating point differences expected)
-    assert np.allclose(pt_patches[0], eq_patches, atol=1e-5, rtol=1e-5)
+    assert np.allclose(
+        pt_patches[0], eq_patches, atol=1e-5, rtol=1e-5
+    ), f"Mean absolute difference: {np.mean(np.abs(pt_patches[0] - eq_patches))}, Max absolute difference: {np.max(np.abs(pt_patches[0] - eq_patches))}"
 
 
 def test_layer_norm_equivalence(pt_model_and_preprocess, ensure_weights):
     """Test that LayerNorm produces the same output."""
-    model, _ = pt_model_and_preprocess
+    model, _, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Create test input
     test_input_np = np.random.randn(50, 768).astype(np.float32)
-    test_input_pt = torch.from_numpy(test_input_np)
+    test_input_pt = torch.from_numpy(test_input_np).to(torch_device)
     test_input_jax = jnp.array(test_input_np)
 
     # PyTorch LayerNorm
     with torch.no_grad():
-        pt_output = pt_visual.ln_pre(test_input_pt[None, :, :])[0].numpy()
+        pt_output = pt_visual.ln_pre(test_input_pt[None, :, :])[0].cpu().numpy()
 
     # Equinox LayerNorm
     eq_output = np.array(jax.vmap(eq_model.ln_pre)(test_input_jax))
 
     # Should match to numerical precision
-    assert np.allclose(pt_output, eq_output, atol=1e-5, rtol=1e-5)
+    assert np.allclose(
+        pt_output, eq_output, atol=1e-5, rtol=1e-5
+    ), f"Mean absolute difference: {np.mean(np.abs(pt_output - eq_output))}, Max absolute difference: {np.max(np.abs(pt_output - eq_output))}"
 
 
 def test_attention_mechanism(pt_model_and_preprocess, ensure_weights):
     """Test that the attention mechanism produces matching outputs."""
-    model, preprocess = pt_model_and_preprocess
+    model, preprocess, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Create test input matching the output of ln_pre
     img = Image.new("RGB", (224, 224), (128, 128, 128))
-    img_pt = preprocess(img).unsqueeze(0)
-    img_jax = jnp.array(img_pt.numpy())
+    img_pt = preprocess(img).unsqueeze(0).to(torch_device)
+    img_jax = jnp.array(img_pt.cpu().numpy())
 
     # Get to the input of first attention block
     with torch.no_grad():
@@ -246,6 +255,7 @@ def test_attention_mechanism(pt_model_and_preprocess, ensure_weights):
                 x_pt_ln1[None, :, :],
                 need_weights=False,
             )[0][0]
+            .cpu()
             .numpy()
         )
 
@@ -253,46 +263,50 @@ def test_attention_mechanism(pt_model_and_preprocess, ensure_weights):
 
     # Attention should match very closely
     max_diff = np.max(np.abs(pt_attn_out - eq_attn_out))
-    assert max_diff < 1e-5, f"Attention outputs differ by {max_diff}"
+    assert (
+        max_diff < 1e-5
+    ), f"Attention outputs differ by {max_diff}. Mean absolute difference: {np.mean(np.abs(pt_attn_out - eq_attn_out))}, Max absolute difference: {np.max(np.abs(pt_attn_out - eq_attn_out))}"
 
 
 def test_mlp_with_quick_gelu(pt_model_and_preprocess, ensure_weights):
     """Test that MLP with QuickGELU produces matching outputs."""
-    model, _ = pt_model_and_preprocess
+    model, _, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Create test input
     test_input_np = np.random.randn(50, 768).astype(np.float32)
-    test_input_pt = torch.from_numpy(test_input_np)
+    test_input_pt = torch.from_numpy(test_input_np).to(torch_device)
     test_input_jax = jnp.array(test_input_np)
 
     # PyTorch MLP (should be using QuickGELU now)
     with torch.no_grad():
-        pt_output = pt_visual.transformer.resblocks[0].mlp(test_input_pt).numpy()
+        pt_output = pt_visual.transformer.resblocks[0].mlp(test_input_pt).cpu().numpy()
 
     # Equinox MLP
     eq_output = np.array(eq_model.blocks[0].mlp(test_input_jax))
 
     # Should match closely (QuickGELU is deterministic)
     max_diff = np.max(np.abs(pt_output - eq_output))
-    assert max_diff < 1e-4, f"MLP outputs differ by {max_diff}"
+    assert (
+        max_diff < 1e-4
+    ), f"MLP outputs differ by {max_diff}. Mean absolute difference: {np.mean(np.abs(pt_output - eq_output))}, Max absolute difference: {np.max(np.abs(pt_output - eq_output))}"
 
 
 def test_full_transformer_block(pt_model_and_preprocess, ensure_weights):
     """Test that a complete transformer block produces matching outputs."""
-    model, preprocess = pt_model_and_preprocess
+    model, preprocess, torch_device = pt_model_and_preprocess
     pt_visual = model.visual
 
     eq_model = ViTB32(image_size=224, patch_size=32, d=768, layers=12, nheads=12)
-    eq_model = load_npz_into_model(eq_model, ensure_weights)
+    eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Get to block 0 input
     img = Image.new("RGB", (224, 224), (128, 128, 128))
-    img_pt = preprocess(img).unsqueeze(0)
-    img_jax = jnp.array(img_pt.numpy())
+    img_pt = preprocess(img).unsqueeze(0).to(torch_device)
+    img_jax = jnp.array(img_pt.cpu().numpy())
 
     with torch.no_grad():
         x_pt = pt_visual.conv1(img_pt)
@@ -312,7 +326,9 @@ def test_full_transformer_block(pt_model_and_preprocess, ensure_weights):
 
     # Run through first block
     with torch.no_grad():
-        pt_block_out = pt_visual.transformer.resblocks[0](x_pt[None, :, :])[0].numpy()
+        pt_block_out = (
+            pt_visual.transformer.resblocks[0](x_pt[None, :, :])[0].cpu().numpy()
+        )
 
     eq_block_out = np.array(eq_model.blocks[0](x_eq))
 

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sarm"
 version = "0.1.0"
@@ -5,9 +9,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "einops>=0.8.1",
     "equinox>=0.13.2",
-    "jax==0.6.0",
+    "faker>=37.12.0",
+    "jax[cuda12]==0.6.0",
+    "lerobot>=0.3.2",
+    "opencv-contrib-python>=4.12.0.88",
+    "opencv-python>=4.12.0.88",
+    "optax>=0.2.6",
+    "tokenizers>=0.22.1",
     "torch>=2.9.0",
+    "zarr>=2.18.3",
 ]
 
 [tool.setuptools.packages.find]
@@ -22,3 +34,6 @@ test = [
     "pillow>=12.0.0",
     "pytest>=8.4.2",
 ]
+
+[tool.black]
+line-length = 100
