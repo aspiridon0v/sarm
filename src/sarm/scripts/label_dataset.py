@@ -45,7 +45,7 @@ Output Files:
        - Compatible with LeRobot's visualize_dataset.py script
        - FAST: Videos are copied directly without re-encoding (huge time savings!)
 """
-
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -55,34 +55,62 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-TASK_NAMES = [
-    "Grasp right corner",
-    "Grasp left corner",
-    "Fold towel horizontally",
-    "Grasp right edge",
-    "Fold towel vertically",
-]
 
-# Camera keys in the dataset
-CAMERA_KEYS = [
-    "observation.images.wrist1",
-    "observation.images.wrist2",
-    "observation.images.stereo",
-]
+class BoundaryPredictor:
+    def __init__(self, ep_starts, q=.2, min_samples=0):
+        self.ep_starts = ep_starts
+        self.durations = defaultdict(list)
+        self.q = q
+        self.min_samples=min_samples
+
+    def update(self, boundaries):
+        self.durations = defaultdict(list)
+        for ep_idx, bounds in boundaries.items():
+            if len(bounds) < 2:
+                continue
+            for i, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
+                if i == 0:
+                    self.durations[i].append(a[0] - self.ep_starts[ep_idx])
+                self.durations[i+1].append(b[0] -a[0]) 
+    
+    def quantile_duration(self, durations):
+        if durations == [] or len(durations) < self.min_samples:
+            return 0
+        return int(np.quantile(durations,self.q))
+        
+        
+    def predict(self, current_bounds):
+        if current_bounds == []:
+            return self.quantile_duration(self.durations[0])
+        sorted_bounds = sorted(current_bounds, key=lambda x: x[0])
+        last_frame, last_id = sorted_bounds[-1]
+        next_id = last_id + 1
+        if self.durations[next_id] == []:
+            return 0
+        else:
+            return self.quantile_duration(self.durations[next_id])
+    
+    def predict_subtask_end(self, current_bounds, ep_start):
+        last_idx = np.max([b[0] for b in current_bounds] + [ep_start])
+        sub_taks_lengh = self.predict(current_bounds=current_bounds)
+        return int(sub_taks_lengh  + last_idx)
 
 
 class DatasetLabeler:
     """Interactive labeler for robot datasets with subtask boundary annotation."""
 
-    def __init__(self, repo_id: str, task_names: List[str]):
+    def __init__(self, repo_id: str,
+                 task_names: List[str],
+                 camera_keys: List[str],
+                 boundaries:Optional[Dict[int, List[tuple]]]=None):
         self.dataset = LeRobotDataset(repo_id=repo_id)
         self.task_names = task_names
+        self.camera_keys = camera_keys
         self.num_subtasks = len(task_names)
 
         # Get episode information from lerobot dataset
         self.num_episodes = self.dataset.num_episodes
-        self.episode_starts = self.dataset.episode_data_index["from"].tolist()
-        self.episode_ends = self.dataset.episode_data_index["to"].tolist()
+
 
         print(f"Dataset loaded: {repo_id}")
         print(f"Number of episodes: {self.num_episodes}")
@@ -95,8 +123,11 @@ class DatasetLabeler:
         self.playback_speed = 1  # frames per update
 
         # Subtask boundaries: dict[episode_idx] -> list of (frame_idx, subtask_idx)
-        self.boundaries: Dict[int, List[tuple]] = {ep: [] for ep in range(self.num_episodes)}
+        self.boundaries = {ep: [] for ep in range(self.num_episodes)} if boundaries is None else boundaries
 
+        # Boundary predictor
+        self.predictor = BoundaryPredictor([self.get_episode_frames(ep)[0] for ep in range(self.num_episodes)])
+        self.fast_mode = True
         # Running state
         self.running = True
 
@@ -105,8 +136,11 @@ class DatasetLabeler:
 
     def get_episode_frames(self, episode_idx: int):
         """Get start and end frame indices for an episode."""
-        start_idx = self.episode_starts[episode_idx]
-        end_idx = self.episode_ends[episode_idx]
+        
+        ep = self.dataset.meta.episodes[episode_idx]
+        start_idx = ep["dataset_from_index"]
+        end_idx = ep["dataset_to_index"]
+        
         return start_idx, end_idx
 
     def tensor_to_image(self, tensor: torch.Tensor) -> np.ndarray:
@@ -130,7 +164,7 @@ class DatasetLabeler:
     def create_display_frame(self, frame_data: Dict) -> np.ndarray:
         """Create a combined display with all three camera views."""
         images = []
-        for cam_key in CAMERA_KEYS:
+        for cam_key in self.camera_keys:
             if cam_key in frame_data:
                 img = self.tensor_to_image(frame_data[cam_key])
                 # Resize for display (make smaller if needed)
@@ -146,7 +180,7 @@ class DatasetLabeler:
         camera_view = np.hstack(images)
 
         # Create info panel at top (for episode info and boundaries)
-        info_panel_height = 150
+        info_panel_height = 200
         info_panel = np.zeros((info_panel_height, camera_view.shape[1], 3), dtype=np.uint8)
 
         # Add episode and frame info to top panel
@@ -155,7 +189,11 @@ class DatasetLabeler:
         total_frames_in_episode = end_idx - start_idx
 
         episode_info = [
-            f"Episode: {self.current_episode}/{self.num_episodes-1}  |  Frame: {frame_in_episode}/{total_frames_in_episode-1} (Global: {self.current_frame})  |  Status: {'PAUSED' if self.paused else 'PLAYING'}",
+            f"Episode: {self.current_episode}/{self.num_episodes-1}  |"
+            f"  Frame: {frame_in_episode}/{total_frames_in_episode-1} (Global: {self.current_frame})  |"
+            f"  Status: {'PAUSED' if self.paused else 'PLAYING'}  |"
+            f"  Speed: {self.playback_speed}x {'(Fast Mode)' if self.fast_mode else ''}"
+
         ]
 
         for i, text in enumerate(episode_info):
@@ -203,12 +241,12 @@ class DatasetLabeler:
             )
 
         # Create controls panel at bottom
-        controls_panel_height = 200
+        controls_panel_height = 160
         controls_panel = np.zeros((controls_panel_height, camera_view.shape[1], 3), dtype=np.uint8)
 
         controls_text = [
             "Controls:",
-            "  SPACE: Play/Pause",
+            "  SPACE: Play/Pause  |  UP: Jump to predicted boundary  |  F: Toggle fast mode",
             "  LEFT/RIGHT: Previous/Next frame",
             "  N: Next episode  |  P: Previous episode",
             f"  1-{self.num_subtasks}: Mark END of subtask",
@@ -221,9 +259,9 @@ class DatasetLabeler:
             cv2.putText(
                 controls_panel,
                 text,
-                (10, 25 + i * 22),
+                (10, 20 + i * 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.45,
                 (255, 255, 255),
                 1,
             )
@@ -254,14 +292,10 @@ class DatasetLabeler:
             self.current_frame = start_idx
 
     def mark_boundary(self, subtask_idx: int):
-        """Mark a subtask boundary at the current frame.
-
-        This marks the END of subtask_idx (and implicitly the start of subtask_idx+1).
-        """
         if 0 <= subtask_idx < self.num_subtasks:
             self.boundaries[self.current_episode].append((self.current_frame, subtask_idx))
-            # Sort boundaries by frame index
             self.boundaries[self.current_episode].sort(key=lambda x: x[0])
+            self.predictor.update(self.boundaries)
             print(
                 f"Marked END of '{self.task_names[subtask_idx]}' at frame {self.current_frame} "
                 f"(Episode {self.current_episode})"
@@ -272,9 +306,9 @@ class DatasetLabeler:
                 )
 
     def undo_last_boundary(self):
-        """Remove the last boundary in the current episode."""
         if self.current_episode in self.boundaries and self.boundaries[self.current_episode]:
             removed = self.boundaries[self.current_episode].pop()
+            self.predictor.update(self.boundaries)
             print(f"Removed boundary: {removed}")
 
     def compute_rewards(self) -> np.ndarray:
@@ -344,129 +378,60 @@ class DatasetLabeler:
 
         return rewards
 
-    def save_dataset_with_rewards_fast(self, output_dir: str = "data"):
-        """Save the dataset with 'next.reward' by copying videos and modifying parquet files only.
+    def save_dataset_with_rewards(self, output_dir: str = "data"):
+        """Save the dataset with 'next.reward' using lerobot's modify_features utility.
 
         This is much faster than save_dataset_with_rewards() since it avoids re-encoding videos.
 
         Args:
             output_dir: Directory to save the new dataset (default: "data")
         """
-        import shutil
         from pathlib import Path
-
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        from lerobot.datasets.dataset_tools import modify_features
 
         # Compute rewards
         print("\n  Computing rewards...")
         rewards = self.compute_rewards()
         print(f"  ✓ Rewards computed for {len(rewards)} frames")
 
-        # Create output directory if it doesn't exist
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
         print("\n" + "=" * 50)
-        print("Fast Save: Copying videos and modifying parquet files...")
+        print("Fast Save: Using modify_features to add rewards...")
         print("=" * 50)
 
         # Dataset name
         dataset_name = self.dataset.repo_id.split("/")[-1] + "_with_rewards"
-        full_output_path = output_path / dataset_name
+        output_path = Path(output_dir) / dataset_name
 
         print(f"\nCreating new LeRobotDataset: {dataset_name}")
-        print(f"  Output: {full_output_path}")
-        print(f"  Adding 'next.reward' column")
+        print(f"  Output: {output_path}")
+        print(f"  Adding 'next.reward' feature")
         print(f"  Reward range: [{rewards.min():.3f}, {rewards.max():.3f}]")
 
-        # Remove existing directory if it exists
-        if full_output_path.exists():
-            print(f"  Removing existing directory...")
-            shutil.rmtree(full_output_path)
+        # Use modify_features to add the reward feature
+        # Create a callable that returns the reward for each frame
+        # The callable signature is: (row_dict, episode_idx, frame_in_episode) -> value
+        def get_reward(row_dict, episode_idx, frame_in_episode):
+            # Get the global frame index from the row
+            global_idx = row_dict["index"]
+            return float(rewards[global_idx])
 
-        # Get source dataset root path
-        source_root = Path(self.dataset.root)
-
-        print(f"\n1. Copying directory structure and videos...")
-
-        # Copy videos directory directly (no re-encoding!)
-        if (source_root / "videos").exists():
-            print(f"  Copying videos/...")
-            shutil.copytree(source_root / "videos", full_output_path / "videos")
-
-        # Copy images directory if it exists (for non-video datasets)
-        if (source_root / "images").exists():
-            print(f"  Copying images/...")
-            shutil.copytree(source_root / "images", full_output_path / "images")
-
-        # Copy meta directory
-        print(f"  Copying meta/...")
-        shutil.copytree(source_root / "meta", full_output_path / "meta")
-
-        # Update info.json to add next.reward feature
-        import json
-
-        info_path = full_output_path / "meta" / "info.json"
-        with open(info_path, "r") as f:
-            info = json.load(f)
-
-        # Add next.reward to features
-        info["features"]["next.reward"] = {"dtype": "float32", "shape": [1]}
-        info["data_path"] = (
-            f"data/chunk-{{episode_chunk:03d}}/episode_{{episode_index:06d}}.parquet"
-        )
-
-        with open(info_path, "w") as f:
-            json.dump(info, f, indent=2)
-
-        print(f"\n2. Modifying parquet files to add rewards...")
-
-        # Create data directory structure
-        (full_output_path / "data").mkdir(parents=True, exist_ok=True)
-
-        # Process each parquet file
-        source_data_dir = source_root / "data"
-        for chunk_dir in sorted(source_data_dir.iterdir()):
-            if not chunk_dir.is_dir():
-                continue
-
-            # Create corresponding output chunk directory
-            output_chunk_dir = full_output_path / "data" / chunk_dir.name
-            output_chunk_dir.mkdir(parents=True, exist_ok=True)
-
-            # Process each parquet file in the chunk
-            for parquet_file in sorted(chunk_dir.glob("*.parquet")):
-                # Read the original parquet file
-                table = pq.read_table(parquet_file)
-
-                # Determine the frame indices for this episode
-                episode_indices = table.column("index").to_pylist()
-                start_idx = episode_indices[0]
-                end_idx = episode_indices[-1] + 1
-
-                # Get rewards for this episode
-                episode_rewards = rewards[start_idx:end_idx]
-
-                # Create next.reward column with shape (N, 1) to match LeRobot format
-                reward_column = pa.array(
-                    [[r] for r in episode_rewards], type=pa.list_(pa.float32(), 1)
+        new_dataset = modify_features(
+            dataset=self.dataset,
+            add_features={
+                "next.reward": (
+                    get_reward,
+                    {"dtype": "float32", "shape": (1,), "names": None}
                 )
-
-                # Add the new column to the table
-                new_table = table.append_column("next.reward", reward_column)
-
-                # Write the modified table to the output directory
-                output_file = output_chunk_dir / parquet_file.name
-                pq.write_table(new_table, output_file)
-
-                print(f"  ✓ {parquet_file.name}")
+            },
+            output_dir=output_path,
+            repo_id=dataset_name,
+        )
 
         print(f"\n✓ Dataset saved successfully (no video re-encoding needed)!")
-        print(f"  Location: {full_output_path}")
+        print(f"  Location: {new_dataset.root}")
 
         # Save metadata
-        metadata_path = full_output_path / "labeling_metadata.txt"
+        metadata_path = new_dataset.root / "labeling_metadata.txt"
         with open(metadata_path, "w") as f:
             f.write(f"Original dataset: {self.dataset.repo_id}\n")
             f.write(f"Total frames: {len(self.dataset)}\n")
@@ -491,167 +456,83 @@ class DatasetLabeler:
 
         print(f"\n💡 Load with:")
         print(f"   from lerobot.datasets.lerobot_dataset import LeRobotDataset")
-        print(f'   ds = LeRobotDataset("{dataset_name}", root="{full_output_path}")')
+        print(f'   ds = LeRobotDataset("{dataset_name}", root="{new_dataset.root}")')
 
-        return full_output_path
+        return new_dataset.root
 
-    def save_dataset_with_rewards(self, output_dir: str = "data"):
-        """Save the dataset with an additional 'next.reward' feature as a proper LeRobotDataset.
-
-        This uses the LeRobotDataset API to create a new dataset with the 'next.reward' feature.
-        Can be loaded with: LeRobotDataset(repo_id="dataset_name_with_rewards", root=output_dir)
-
-        NOTE: This method re-encodes videos which is slow. Use save_dataset_with_rewards_fast() instead
-        if you want to avoid re-encoding (much faster for large datasets).
+    @staticmethod
+    def load_boundaries_from_metadata(metadata_path: str) -> Dict[int, List[tuple]]:
+        """Load boundaries from a labeling_metadata.txt file.
 
         Args:
-            output_dir: Directory to save the new dataset (default: "data")
+            metadata_path: Path to the labeling_metadata.txt file
+
+        Returns:
+            Dictionary mapping episode_idx -> list of (frame_idx, subtask_idx) tuples
         """
-        import shutil
-        from pathlib import Path
+        import re
 
-        # Compute rewards
-        print("\n  Computing rewards...")
-        rewards = self.compute_rewards()
-        print(f"  ✓ Rewards computed for {len(rewards)} frames")
+        boundaries = {}
+        task_names_map = {}  # Maps task name string -> subtask_idx
+        current_episode = None
 
-        # Create output directory if it doesn't exist
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
+        with open(metadata_path, 'r') as f:
+            lines = f.readlines()
 
-        print("\n" + "=" * 50)
-        print("Saving LeRobotDataset with rewards...")
-        print("=" * 50)
+        # First pass: Parse the Subtasks section to build the task name mapping
+        in_subtasks_section = False
+        in_boundaries_section = False
 
-        # Dataset name
-        dataset_name = self.dataset.repo_id.split("/")[-1] + "_with_rewards"
-        full_output_path = output_path / dataset_name
+        for line in lines:
+            # Parse subtasks section: "  0. Grasp right corner"
+            if "Subtasks:" in line:
+                in_subtasks_section = True
+                in_boundaries_section = False
+                continue
 
-        print(f"\nCreating new LeRobotDataset: {dataset_name}")
-        print(f"  Output: {full_output_path}")
-        print(f"  Adding 'next.reward' column with shape: {rewards.shape}")
-        print(f"  Reward range: [{rewards.min():.3f}, {rewards.max():.3f}]")
+            if in_subtasks_section and not in_boundaries_section:
+                subtask_match = re.match(r'\s*(\d+)\.\s+(.+)', line)
+                if subtask_match:
+                    subtask_idx = int(subtask_match.group(1))
+                    task_name = subtask_match.group(2).strip()
+                    task_names_map[task_name] = subtask_idx
+                    continue
 
-        # Remove existing directory if it exists
-        if full_output_path.exists():
-            print(f"  Removing existing directory...")
-            shutil.rmtree(full_output_path)
+            # Find the "Boundaries" section
+            if "Boundaries (marking END of subtasks):" in line:
+                in_boundaries_section = True
+                in_subtasks_section = False
+                continue
 
-        # Add reward feature to the existing features (use "next.reward" for LeRobot visualization compatibility)
-        new_features = {**self.dataset.features, "next.reward": {"dtype": "float32", "shape": (1,)}}
+            if not in_boundaries_section:
+                continue
 
-        # Create new dataset using LeRobot API
-        print(f"\n  Creating dataset with LeRobot API...")
-        new_dataset = LeRobotDataset.create(
-            repo_id=dataset_name,
-            fps=self.dataset.fps,
-            features=new_features,
-            root=full_output_path,  # Pass the full path, not parent
-            robot_type=self.dataset.meta.robot_type,
-            use_videos=len(self.dataset.meta.video_keys) > 0,
-            image_writer_processes=4,
-            image_writer_threads=1,
-        )
+            # Parse episode line: "  Episode 0:"
+            episode_match = re.match(r'\s*Episode (\d+):', line)
+            if episode_match:
+                current_episode = int(episode_match.group(1))
+                boundaries[current_episode] = []
+                continue
 
-        # Copy each episode with the added 'next.reward' feature
-        # Calculate total frames to process
-        total_frames = sum(
-            self.get_episode_frames(ep_idx)[1] - self.get_episode_frames(ep_idx)[0]
-            for ep_idx in range(self.num_episodes)
-        )
+            # Parse "No boundaries" line
+            if "No boundaries" in line:
+                continue
 
-        print(f"\n  Copying {self.num_episodes} episodes ({total_frames} total frames)...")
+            # Parse boundary line: "    Frame 45 (global 123): END of 'Grasp right corner'"
+            boundary_match = re.match(r'\s*Frame \d+ \(global (\d+)\): END of \'(.+)\'', line)
+            if boundary_match and current_episode is not None:
+                global_frame_idx = int(boundary_match.group(1))
+                task_name = boundary_match.group(2)
 
-        # Single progress bar for all frames
-        pbar = tqdm(total=total_frames, desc="  Processing frames", unit="frame", leave=True)
-
-        for ep_idx in range(self.num_episodes):
-            start_idx, end_idx = self.get_episode_frames(ep_idx)
-
-            # Get episode task
-            first_frame = self.dataset[start_idx]
-            task = first_frame["task"]
-
-            # Add each frame with the reward
-            for frame_idx in range(start_idx, end_idx):
-                # Use dataset[idx] to get properly loaded frame (with images/videos)
-                frame = self.dataset[frame_idx]
-
-                # Convert to dict and remove metadata fields
-                frame_dict = {}
-                for key in self.dataset.features.keys():
-                    if key not in [
-                        "index",
-                        "episode_index",
-                        "frame_index",
-                        "timestamp",
-                        "task_index",
-                        "task",
-                    ]:
-                        value = frame[key]
-                        # Convert torch tensors to numpy
-                        if isinstance(value, torch.Tensor):
-                            value = value.cpu().numpy()
-
-                        # Convert images from CHW to HWC format if needed
-                        if key in self.dataset.meta.camera_keys and value.ndim == 3:
-                            # Images come as (C, H, W) but LeRobot expects (H, W, C)
-                            value = np.transpose(value, (1, 2, 0))
-
-                        frame_dict[key] = value
-
-                # Add reward (using "next.reward" for LeRobot visualization compatibility)
-                frame_dict["next.reward"] = np.array([rewards[frame_idx]], dtype=np.float32)
-
-                # Add frame to new dataset
-                timestamp = frame["timestamp"].item()
-                new_dataset.add_frame(frame_dict, task=task, timestamp=timestamp)
-
-                # Update progress bar
-                pbar.update(1)
-                pbar.set_postfix({"episode": f"{ep_idx+1}/{self.num_episodes}"})
-
-            # Save episode (this triggers video encoding which can be slow)
-            pbar.set_description(f"  Saving episode {ep_idx+1}/{self.num_episodes}")
-            new_dataset.save_episode()
-            pbar.set_description("  Processing frames")
-
-        pbar.close()
-
-        print(f"\n✓ LeRobotDataset saved successfully!")
-        print(f"  Location: {full_output_path}")
-        print(f"  Total episodes: {new_dataset.num_episodes}")
-        print(f"  Total frames: {new_dataset.num_frames}")
-
-        # Save metadata
-        metadata_path = full_output_path / "labeling_metadata.txt"
-        with open(metadata_path, "w") as f:
-            f.write(f"Original dataset: {self.dataset.repo_id}\n")
-            f.write(f"Total frames: {len(self.dataset)}\n")
-            f.write(f"Number of episodes: {self.num_episodes}\n")
-            f.write(f"Reward range: [{rewards.min():.6f}, {rewards.max():.6f}]\n")
-            f.write(f"\nSubtasks:\n")
-            for i, name in enumerate(self.task_names):
-                f.write(f"  {i}. {name}\n")
-            f.write(f"\nBoundaries (marking END of subtasks):\n")
-            for ep_idx in range(self.num_episodes):
-                if self.boundaries.get(ep_idx):
-                    f.write(f"  Episode {ep_idx}:\n")
-                    for frame_idx, subtask_idx in self.boundaries[ep_idx]:
-                        start_idx, _ = self.get_episode_frames(ep_idx)
-                        frame_in_ep = frame_idx - start_idx
-                        f.write(
-                            f"    Frame {frame_in_ep} (global {frame_idx}): END of '{self.task_names[subtask_idx]}'\n"
-                        )
+                # Look up the subtask index from the task name
+                if task_name in task_names_map:
+                    subtask_idx = task_names_map[task_name]
+                    boundaries[current_episode].append((global_frame_idx, subtask_idx))
                 else:
-                    f.write(f"  Episode {ep_idx}: No boundaries\n")
-        print(f"    └── labeling_metadata.txt")
+                    print(f"Warning: Unknown task name '{task_name}' in boundaries section")
 
-        print(f"\n💡 Load with:")
-        print(f"   from lerobot.datasets.lerobot_dataset import LeRobotDataset")
-        print(f'   ds = LeRobotDataset("{dataset_name}", root="{full_output_path}")')
+        return boundaries
 
-        return full_output_path
 
     def run(self):
         """Main loop for interactive labeling."""
@@ -689,7 +570,7 @@ class DatasetLabeler:
                 elif key == ord("s"):
                     print("\nSaving and quitting...")
                     # Use fast save method that copies videos instead of re-encoding
-                    self.save_dataset_with_rewards_fast()
+                    self.save_dataset_with_rewards()
                     break
                 elif key == ord("n"):
                     self.next_episode()
@@ -703,7 +584,15 @@ class DatasetLabeler:
                 elif key == 32:  # space
                     self.paused = not self.paused
                     print(f"{'Paused' if self.paused else 'Playing'}...")
-                elif key == 81 or key == 83:  # Left arrow (81) or Right arrow (83) on some systems
+                elif key == ord("f"):  # F key
+                    self.fast_mode = not self.fast_mode
+                    print(f"Fast mode: {'ON' if self.fast_mode else 'OFF'}")
+                elif key == 82:  # Up arrow
+                    _, ep_end = self.get_episode_frames(self.current_episode)
+                    predicted = self.predictor.predict(self.boundaries[self.current_episode])
+                    if predicted is not None:
+                        self.move_frame(predicted)
+                elif key == 81 or key == 83:  # Left arrow (81) or Right arrow (83)
                     if key == 81:  # Left arrow
                         self.move_frame(-1)
                     elif key == 83:  # Right arrow
@@ -715,8 +604,14 @@ class DatasetLabeler:
                 # Auto-advance if playing
                 if not self.paused:
                     start_idx, end_idx = self.get_episode_frames(self.current_episode)
+                    self.playback_speed = 1
+                    if self.fast_mode:
+                        predicted = self.predictor.predict_subtask_end(self.boundaries[self.current_episode], start_idx)
+                        if predicted - self.current_frame > 15:
+                            self.playback_speed =  3
+                            
                     self.current_frame += self.playback_speed
-                    if self.current_frame >= end_idx:
+                    if self.current_frame >= end_idx:   
                         # Loop back or move to next episode
                         self.current_frame = start_idx
 
@@ -728,9 +623,30 @@ class DatasetLabeler:
 def main():
     """Main entry point."""
 
+    TASK_NAMES = [
+        "Grasp right corner",
+        "Grasp left corner",
+        "Fold towel horizontally",
+        "Grasp right edge",
+        "Fold towel vertically",
+    ]
+
+    # Camera keys in the dataset
+    CAMERA_KEYS = [
+        "observation.images.left_wrist",
+        "observation.images.right_wrist",
+        "observation.images.topdown",
+    ]
+    
+    boundaries = None
+    # Uncomment to load existing labels
+    # boundaries = DatasetLabeler.load_boundaries_from_metadata('data/labeling_metadata.txt')
+    
     labeler = DatasetLabeler(
-        repo_id="ETHRC/piper_towel_v0",
+        repo_id="ETHRC/towel_base",
         task_names=TASK_NAMES,
+        camera_keys=CAMERA_KEYS,
+        boundaries=boundaries
     )
     labeler.run()
 
