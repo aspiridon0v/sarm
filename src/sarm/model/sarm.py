@@ -1,3 +1,5 @@
+import logging
+
 import einops
 import equinox as eqx
 import jax
@@ -5,6 +7,8 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from sarm.model.clip import CLIP, Block
+
+logger = logging.getLogger(__name__)
 
 
 class ProgressTransformer(eqx.Module):
@@ -89,7 +93,8 @@ class ProgressTransformer(eqx.Module):
         mask_1d = jnp.arange(timesteps) < length
         mask_1d = jnp.where(mask_1d, 0.0, float("-inf"))
         mask_1d = einops.repeat(mask_1d, "t -> (n t)", n=num_cameras + 3)
-        mask = mask_1d[None, :] + mask_1d[:, None]  # (N+3)*T, (N+3)*T
+        # Only mask keys (columns), not queries (rows), to prevent all-inf rows
+        mask = mask_1d[None, :]  # (1, (N+3)*T) -> broadcasts over query dimension
         return mask
 
     def __call__(
@@ -142,6 +147,14 @@ class ProgressTransformer(eqx.Module):
         )  # (T,) TODO: add conditional sparse projection
 
         return jax.vmap(jax.nn.sigmoid)(features)  # (T,)
+
+    def save_checkpoint(self, path: str):
+        eqx.tree_serialise_leaves(path, self)
+        logger.info(f"Saved checkpoint to {path}")
+
+    def load_checkpoint(self, path: str):
+        self = eqx.tree_deserialise_leaves(path, self)
+        logger.info(f"Loaded checkpoint from {path}")
 
 
 class StageTransformer(eqx.Module):
@@ -200,7 +213,8 @@ class StageTransformer(eqx.Module):
         mask_1d = jnp.arange(timesteps) < length
         mask_1d = jnp.where(mask_1d, 0.0, float("-inf"))
         mask_1d = einops.repeat(mask_1d, "t -> (n t)", n=num_cameras + 2)
-        mask = mask_1d[None, :] + mask_1d[:, None]  # (N+2)*T, (N+2)*T
+        # Only mask keys (columns), not queries (rows), to prevent all-inf rows
+        mask = mask_1d[None, :]  # (1, (N+2)*T) -> broadcasts over query dimension
         return mask
 
     def __call__(
@@ -211,13 +225,13 @@ class StageTransformer(eqx.Module):
         length: int,
         dense_schema: jax.Array,
     ):
-        """Forward pass for the subtask transformer.
+        """Forward pass for the stage transformer.
 
         Args:
             img_features (jax.Array): Image features of shape (N, T, d_vis)
             text_features (jax.Array): Text features of shape (T, d_text)
             state (jax.Array): State features of shape (T, d_state)
-            subtask (jax.Array): Subtask features of shape (T, C)
+            length (int): Length of the sequence
             dense_schema (jax.Array): Boolean if the schema is dense
         Returns:
             jax.Array: Output features of shape (T)
@@ -244,11 +258,19 @@ class StageTransformer(eqx.Module):
         features = einops.rearrange(features, "(n t) d -> t (n d)", n=N + 2, t=T)
         features = jax.vmap(self.fusion_mlp)(features)  # (T, d_model)
 
-        logits = jax.vmap(self.final_proj["dense"])(
+        logits = jax.vmap(self.final_proj["sparse"])(
             features
         )  # (T, C) TODO: add conditional sparse projection
 
         return logits  # (T, C)
+
+    def save_checkpoint(self, path: str):
+        eqx.tree_serialise_leaves(path, self)
+        logger.info(f"Saved checkpoint to {path}")
+
+    def load_checkpoint(self, path: str):
+        self = eqx.tree_deserialise_leaves(path, self)
+        logger.info(f"Loaded checkpoint from {path}")
 
 
 class Sarm(eqx.Module):

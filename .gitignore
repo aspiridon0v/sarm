@@ -85,6 +85,6 @@ cert.pem
 
 .cursor/
 .claude/
-.flake8
 data/
 checkpoints/
+wandb/

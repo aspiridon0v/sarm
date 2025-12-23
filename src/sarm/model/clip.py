@@ -20,7 +20,7 @@ def build_causal_mask(context_length):
     return mask
 
 
-def preprocess_image(image: Image.Image) -> jax.Array:
+def preprocess_image(image: Image.Image | np.ndarray) -> jax.Array:
     """
     Preprocess an image for CLIP (sarm/JAX version).
 
@@ -31,6 +31,11 @@ def preprocess_image(image: Image.Image) -> jax.Array:
         Preprocessed image tensor (3, 224, 224)
     """
     # Resize to 224x224
+    if isinstance(image, np.ndarray):
+        C, H, W = image.shape
+        image = (image * 255).astype(np.uint8)
+        image = Image.fromarray(image.reshape(H, W, C))
+
     image = image.resize((224, 224), Image.BICUBIC)
 
     # Convert to numpy array and normalize
@@ -47,6 +52,50 @@ def preprocess_image(image: Image.Image) -> jax.Array:
     image = np.transpose(image, (2, 0, 1))
 
     return jnp.array(image)
+
+
+def preprocess_images_batch(images: np.ndarray | jax.Array) -> jax.Array:
+    """
+    Vectorized preprocessing for a batch of images for CLIP.
+
+    Args:
+        images: Batch of images with shape (..., C, H, W) in range [0, 1]
+
+    Returns:
+        Preprocessed images with shape (..., C, 224, 224)
+    """
+    # Store original batch shape
+    original_shape = images.shape
+    batch_dims = original_shape[:-3]
+    C, H, W = original_shape[-3:]
+
+    # Flatten batch dimensions: (..., C, H, W) -> (N, C, H, W)
+    images = images.reshape(-1, C, H, W)
+    N = images.shape[0]
+
+    # Transpose to (N, H, W, C) for jax.image.resize
+    images = jnp.transpose(images, (0, 2, 3, 1))
+
+    # Resize all images at once using jax
+    images_resized = jax.image.resize(
+        images, shape=(N, 224, 224, C), method="bicubic", antialias=True
+    )
+
+    # CLIP normalization constants
+    mean = jnp.array([0.48145466, 0.4578275, 0.40821073])
+    std = jnp.array([0.26862954, 0.26130258, 0.27577711])
+
+    # Normalize: (N, 224, 224, C)
+    images_normalized = (images_resized - mean) / std
+
+    # Transpose back to (N, C, 224, 224)
+    images_normalized = jnp.transpose(images_normalized, (0, 3, 1, 2))
+
+    # Reshape back to original batch dimensions
+    output_shape = batch_dims + (C, 224, 224)
+    images_normalized = images_normalized.reshape(output_shape)
+
+    return images_normalized
 
 
 class MLP(eqx.Module):

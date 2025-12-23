@@ -11,7 +11,7 @@ from sarm.model.clip import CLIP, load_tokenizer
 from sarm.model.sarm import ProgressTransformer, StageTransformer
 from sarm.scripts.train import (
     clip_inference,
-    step_process_transformer,
+    step_progress_transformer,
     step_stage_transformer,
 )
 
@@ -19,12 +19,13 @@ from sarm.scripts.train import (
 class DummyDataset(Dataset):
     """Dataset that generates synthetic data for testing."""
 
-    def __init__(self, timesteps=8, num_cameras=1, size=100):
+    def __init__(self, timesteps=8, num_cameras=1, size=100, padding=0):
         super().__init__()
         self.tokenizer = load_tokenizer()
         self.timesteps = timesteps
         self.num_cameras = num_cameras
         self.size = size
+        self.padding = padding
 
     def __len__(self):
         return self.size
@@ -43,13 +44,21 @@ class DummyDataset(Dataset):
         text_tokens = np.stack(
             [self.tokenizer("dummy text for testing").squeeze(0) for t in range(self.timesteps)]
         )
+        if self.padding:
+            length = (
+                self.timesteps - self.padding
+                if self.padding > 0 and self.padding < self.timesteps
+                else self.timesteps
+            )
+        else:
+            length = self.timesteps
         return {
             "img": images.astype(np.float32),
             "text": text_tokens,
             "state": state.astype(np.float32),
             "subtask": subtask.astype(np.float32),
             "dense_schema": dense_schema.astype(np.bool_),
-            "length": self.timesteps,
+            "length": length,
             "progress_target": progress.astype(np.float32),
         }
 
@@ -57,7 +66,7 @@ class DummyDataset(Dataset):
 @pytest.fixture
 def dummy_batch():
     """Create a single batch for testing."""
-    dataset = DummyDataset(timesteps=8, num_cameras=1, size=4)
+    dataset = DummyDataset(timesteps=8, num_cameras=1, size=4, padding=2)
     batch_data = [dataset[i] for i in range(4)]
 
     # Collate batch
@@ -128,7 +137,7 @@ def test_process_transformer_step(sarm_modules, dummy_batch):
     opt_state = optimizer.init(eqx.filter(process_transformer, eqx.is_inexact_array))
 
     # Training step
-    new_model, new_opt_state, loss, grads = step_process_transformer(
+    new_model, new_opt_state, loss, grads = step_progress_transformer(
         process_transformer,
         img_features,
         text_features,
@@ -173,7 +182,7 @@ def test_stage_transformer_step(sarm_modules, dummy_batch):
     dense_schemas = jnp.array(dummy_batch["dense_schema"])
     lengths = jnp.array(dummy_batch["length"])
 
-    subtask_labels = jnp.argmax(subtasks, axis=-1).reshape(-1).astype(jnp.int32)
+    subtask_labels = jnp.argmax(subtasks, axis=-1).astype(jnp.int32)
 
     # Extract features
     img_features, text_features = clip_inference(clip_model, images, texts)
@@ -252,7 +261,7 @@ def test_process_transformer_overfitting(sarm_modules):
     # Train for multiple steps
     losses = []
     for _ in range(50):
-        process_transformer, opt_state, loss, _ = step_process_transformer(
+        process_transformer, opt_state, loss, _ = step_progress_transformer(
             process_transformer,
             img_features,
             text_features,
@@ -295,11 +304,11 @@ def test_stage_transformer_overfitting(sarm_modules):
     images = jnp.array(batch["img"])
     texts = jnp.array(batch["text"])
     states = jnp.array(batch["state"])
-    subtasks = jnp.array(batch["subtask"])
+    subtasks = jnp.array(batch["subtask"])  # (B, T, C)
     dense_schemas = jnp.array(batch["dense_schema"])
     lengths = jnp.array(batch["length"])
 
-    subtask_labels = jnp.argmax(subtasks, axis=-1).reshape(-1).astype(jnp.int32)
+    subtask_labels = jnp.argmax(subtasks, axis=-1).astype(jnp.int32)  # (B)
 
     # Extract features once
     img_features, text_features = clip_inference(clip_model, images, texts)
