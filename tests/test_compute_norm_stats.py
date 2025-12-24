@@ -24,12 +24,13 @@ def test_compute_norm_stats_integration():
         output_path = Path(tmpdir) / "norm_stats.json"
 
         # Use a small test dataset or the actual dataset
-        repo_id = "ETHRC/piper_towel_v0_with_rewards"
+        repo_id = "ETHRC/towel_base_with_rewards"
 
         compute_norm_stats(
             repo_id=repo_id,
             output_path=str(output_path),
             mode="gaussian",
+            max_frames=100
         )
 
         # Verify the file was created

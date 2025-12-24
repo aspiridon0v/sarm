@@ -113,10 +113,10 @@ class SarmDataset(LeRobotDataset):
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
         assert ep_idx in self.episodes, f"Episode {ep_idx} not found in the selected episodes."
-        global_idx = self.episodes.index(ep_idx)
-
-        ep_start = self.episode_data_index["from"][global_idx].item()
-        ep_end = self.episode_data_index["to"][global_idx].item()
+        
+        ep = self.meta.episodes[ep_idx]
+        ep_start = ep["dataset_from_index"]
+        ep_end = ep["dataset_to_index"]
 
         # Adjust idx if there's not enough history
         required_history = self.n_obs_steps * self.frame_gap
@@ -125,6 +125,11 @@ class SarmDataset(LeRobotDataset):
         obs_indices = self.get_frame_indices(
             idx, self.n_obs_steps, self.frame_gap, ep_start, ep_end
         )
+
+        # Convert absolute indices to relative indices for filtered dataset
+        if self._absolute_to_relative_idx is not None:
+            obs_indices = [self._absolute_to_relative_idx[i] for i in obs_indices]
+
         sequence = self.hf_dataset.select(obs_indices)
 
         # Extract sequence data
@@ -132,11 +137,11 @@ class SarmDataset(LeRobotDataset):
         for key in sequence.features:
             value = sequence[key]
             if key == "action":
-                seq_item[key] = torch.stack(value)
+                seq_item[key] = torch.stack([v for v in value])
             elif key == "observation.state":
-                seq_item[key] = torch.stack(value)
+                seq_item[key] = torch.stack([v for v in value])
             elif key == "next.reward":
-                progress_list = torch.stack(value).squeeze(-1)
+                progress_list = torch.stack([v for v in value]).squeeze(-1)
             else:
                 seq_item[key] = value[0]
             del value

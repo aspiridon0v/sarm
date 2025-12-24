@@ -15,7 +15,7 @@ def config():
 @pytest.fixture(scope="module")
 def dataset(config: SarmConfig):
 
-    valid_episodes = get_valid_episodes("ETHRC/piper_towel_v0_with_rewards")
+    valid_episodes = get_valid_episodes("ETHRC/towel_base_with_rewards")
     train_episodes, eval_episodes = split_train_eval_episodes(valid_episodes)
 
     train_dataset = SarmDataset(

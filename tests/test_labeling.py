@@ -21,15 +21,25 @@ def test_reward_computation():
     print("- Last subtask ends at episode end")
 
     # Create a mock labeler for testing
+    class MockMeta:
+        def __init__(self):
+            self.episodes = [
+                {"dataset_from_index": 0, "dataset_to_index": 100},
+                {"dataset_from_index": 100, "dataset_to_index": 200},
+                {"dataset_from_index": 200, "dataset_to_index": 300},
+                {"dataset_from_index": 300, "dataset_to_index": 400},
+            ]
+
     class MockDataset:
+        def __init__(self):
+            self.meta = MockMeta()
+
         def __len__(self):
             return 400
 
     labeler = DatasetLabeler.__new__(DatasetLabeler)
     labeler.dataset = MockDataset()
     labeler.num_episodes = 4
-    labeler.episode_starts = [0, 100, 200, 300]
-    labeler.episode_ends = [100, 200, 300, 400]
     labeler.num_subtasks = len(TASK_NAMES)
 
     # Add some test boundaries (remember: these mark the END of subtasks)

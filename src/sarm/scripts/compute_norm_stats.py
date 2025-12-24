@@ -37,6 +37,7 @@ def compute_norm_stats(
     mode: str = "gaussian",
     state_dim: int | None = None,
     action_dim: int | None = None,
+    max_frames: int | None = None
 ):
     """
     Compute normalization statistics for a LeRobot dataset.
@@ -48,6 +49,7 @@ def compute_norm_stats(
         mode: Normalization mode ("limits" or "gaussian")
         state_dim: Optional dimension to slice state data (e.g., 14 for both arms)
         action_dim: Optional dimension to slice action data
+        max_frames: Number of frames for the stats computation
     """
     print(f"Loading dataset from {repo_id}...")
     dataset = LeRobotDataset(
@@ -55,14 +57,18 @@ def compute_norm_stats(
         root=root,
         download_videos=False,  # We don't need videos for computing stats
     )
-
-    print(f"Dataset loaded. Total frames: {len(dataset)}")
+    N = len(dataset)
+    print(f"Dataset loaded. Total frames: {N}")
+    if max_frames is not None and max_frames < N:
+        N = max_frames
+        print(f"Using {N} frames for calculations")
+    
     print(f"Features: {list(dataset.hf_dataset.features.keys())}")
 
     # Collect state and action data
     print("Collecting state data...")
     states = []
-    for i in tqdm(range(len(dataset)), desc="Loading states"):
+    for i in tqdm(range(N), desc="Loading states"):
         item = dataset.hf_dataset[i]
         if "observation.state" in item:
             state = item["observation.state"]
@@ -80,7 +86,7 @@ def compute_norm_stats(
 
     print("Collecting action data...")
     actions = []
-    for i in tqdm(range(len(dataset)), desc="Loading actions"):
+    for i in tqdm(range(N), desc="Loading actions"):
         item = dataset.hf_dataset[i]
         if "action" in item:
             action = item["action"]
@@ -148,7 +154,7 @@ def compute_norm_stats(
         },
         "metadata": {
             "repo_id": repo_id,
-            "num_samples": len(dataset),
+            "num_samples": N,
             "state_shape": list(states.shape),
             "action_shape": list(actions.shape),
             "mode": mode,

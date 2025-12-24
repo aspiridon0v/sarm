@@ -1,7 +1,10 @@
+import numpy as np
+import logging
 import random
-import re
 from pathlib import Path
 from typing import List, Tuple
+
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 def get_valid_episodes(repo_id: str, root: str | Path | None = None) -> List[int]:
@@ -14,27 +17,21 @@ def get_valid_episodes(repo_id: str, root: str | Path | None = None) -> List[int
     Returns:
         List[int]: Sorted list of valid episode indices (e.g., [0, 1, 5, 7, ...])
     """
-    if root is None:
-        base_path = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id / "data"
-    else:
-        base_path = Path(root)
-
-    episode_pattern = re.compile(r"episode_(\d+)\.parquet")
-
-    valid_episodes = []
-
-    if not base_path.exists():
-        raise FileNotFoundError(f"Data directory not found: {base_path}")
-
-    for chunk_dir in base_path.glob("chunk-*"):
-        if not chunk_dir.is_dir():
-            continue
-        for file in chunk_dir.glob("episode_*.parquet"):
-            match = episode_pattern.match(file.name)
-            if match:
-                ep_idx = int(match.group(1))
-                valid_episodes.append(ep_idx)
-
+    dataset = LeRobotDataset(repo_id=repo_id, root=root)
+    rewards = dataset.hf_dataset['next.reward']
+    NUM_SUBTASKS = np.ceil(np.max(rewards))
+    episodes = list(dataset.meta.episodes['episode_index'])
+    
+    non_valid_episodes = []
+    for ep_idx in episodes:
+        ep = dataset.meta.episodes[ep_idx]
+        ep_end = ep["dataset_to_index"]
+        if np.ceil(rewards[ep_end-1]) != NUM_SUBTASKS:
+            non_valid_episodes.append(ep_idx)
+    
+    if len(non_valid_episodes) > 0:
+        logging.warn(f'Total Episodes {len(episodes)}. INVALID EPISODES found. Episodes with missing subtasks {non_valid_episodes}')
+    valid_episodes = [e for e in episodes if e not in non_valid_episodes]
     return sorted(valid_episodes)
 
 

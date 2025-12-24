@@ -6,17 +6,17 @@ from pathlib import Path
 class GeneralConfig:
     project_name: str = "ethrc_sarm"
     task_name: str = "Fold Towel"
-    repo_id_sparse: str = "ETHRC/piper_towel_v0_with_rewards"
+    repo_id_sparse: str = "ETHRC/towel_base_with_rewards"
     state_norm_path: str | Path = "data/ethrc_data_v0.json"
     camera_names: list[str] = field(
         default_factory=lambda: [
-            "observation.images.wrist1",
-            "observation.images.wrist2",
-            "observation.images.stereo",
+            "observation.images.left_wrist",
+            "observation.images.right_wrist",
+            "observation.images.topdown",
         ]
     )
     seed: int = 42
-    wandb_entity: str = "aspiridonov"
+    wandb_entity: str | None = None  # Set to None to use default account
 
 
 @dataclass
