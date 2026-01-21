@@ -5,6 +5,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from jaxtyping import PyTree, PRNGKeyArray
 
 from sarm.model.clip import CLIP, Block
 
@@ -30,8 +31,11 @@ class ProgressTransformer(eqx.Module):
         text_embed_dim: int = 512,
         state_dim: int = 14,
         num_cameras: int = 1,
-        key=jr.PRNGKey(0),
+        dropout: float = 0.0,
+        key=None,
     ):
+        if key is None:
+            key = jr.PRNGKey(0)
         k_blocks, k_vis, k_text, k_state, k_fusion, k_sparse, k_dense = jr.split(key, 7)
         self.vis_proj = eqx.nn.Linear(vis_embed_dim, d_model, key=k_vis)
         self.text_proj = eqx.nn.Linear(text_embed_dim, d_model, key=k_text)
@@ -50,7 +54,7 @@ class ProgressTransformer(eqx.Module):
             ],
         )
 
-        self.blocks = [Block(d_model, nheads, key=jr.fold_in(k_blocks, i)) for i in range(layers)]
+        self.blocks = [Block(d_model, nheads, key=jr.fold_in(k_blocks, i), dropout=dropout) for i in range(layers)]
         self.positional_embedding = jnp.zeros((1, d_model))
 
     def _subtask_encoding(self, subtask: jax.Array, d_model: int):
@@ -105,6 +109,7 @@ class ProgressTransformer(eqx.Module):
         subtask: jax.Array,
         length: int,
         dense_schema: jax.Array,
+        key: PRNGKeyArray | None = None
     ):
         """Forward pass for the subtask transformer.
 
@@ -136,8 +141,9 @@ class ProgressTransformer(eqx.Module):
         mask = self._build_mask(T, length, N)  # ((N+3)*T, (N+3)*T)
 
         # Apply transformer blocks
-        for block in self.blocks:
-            features = block(features, mask)
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None]*len(self.blocks)
+        for n, block in enumerate(self.blocks):
+            features = block(features, mask, key=keys[n])
 
         features = einops.rearrange(features, "(n t) d -> t (n d)", n=N + 3, t=T)
         features = jax.vmap(self.fusion_mlp)(features)  # (T, d_model)
@@ -153,8 +159,9 @@ class ProgressTransformer(eqx.Module):
         logger.info(f"Saved checkpoint to {path}")
 
     def load_checkpoint(self, path: str):
-        self = eqx.tree_deserialise_leaves(path, self)
+        model = eqx.tree_deserialise_leaves(path, self)
         logger.info(f"Loaded checkpoint from {path}")
+        return model
 
 
 class StageTransformer(eqx.Module):
@@ -178,8 +185,11 @@ class StageTransformer(eqx.Module):
         num_cameras: int = 1,
         num_classes_sparse: int = 4,
         num_classes_dense: int = 8,
-        key=jr.PRNGKey(0),
+        dropout: float = 0.0,
+        key=None,
     ):
+        if key is None:
+            key = jr.PRNGKey(0)
         k_blocks, k_vis, k_text, k_state, k_fusion, k_sparse, k_dense = jr.split(key, 7)
         self.vis_proj = eqx.nn.Linear(vis_embed_dim, d_model, key=k_vis)
         self.text_proj = eqx.nn.Linear(text_embed_dim, d_model, key=k_text)
@@ -198,7 +208,7 @@ class StageTransformer(eqx.Module):
             ],
         )
 
-        self.blocks = [Block(d_model, nheads, key=jr.fold_in(k_blocks, i)) for i in range(layers)]
+        self.blocks = [Block(d_model, nheads, key=jr.fold_in(k_blocks, i), dropout=dropout) for i in range(layers)]
         self.positional_embedding = jnp.zeros((1, d_model))
 
     def _build_mask(self, timesteps: int, length: int, num_cameras: int):
@@ -224,6 +234,7 @@ class StageTransformer(eqx.Module):
         state: jax.Array,
         length: int,
         dense_schema: jax.Array,
+        key: PRNGKeyArray | None = None
     ):
         """Forward pass for the stage transformer.
 
@@ -252,13 +263,15 @@ class StageTransformer(eqx.Module):
         mask = self._build_mask(T, length, N)  # ((N+2)*T, (N+2)*T)
 
         # Apply transformer blocks
-        for block in self.blocks:
-            features = block(features, mask)
+        # Apply transformer blocks
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None]*len(self.blocks)
+        for n, block in enumerate(self.blocks):
+            features = block(features, mask, key=keys[n])
 
         features = einops.rearrange(features, "(n t) d -> t (n d)", n=N + 2, t=T)
         features = jax.vmap(self.fusion_mlp)(features)  # (T, d_model)
 
-        logits = jax.vmap(self.final_proj["sparse"])(
+        logits = jax.vmap(self.final_proj["dense"])(
             features
         )  # (T, C) TODO: add conditional sparse projection
 
@@ -268,9 +281,10 @@ class StageTransformer(eqx.Module):
         eqx.tree_serialise_leaves(path, self)
         logger.info(f"Saved checkpoint to {path}")
 
-    def load_checkpoint(self, path: str):
-        self = eqx.tree_deserialise_leaves(path, self)
+    def load_checkpoint(self, path: str) -> PyTree:
+        model = eqx.tree_deserialise_leaves(path, self)
         logger.info(f"Loaded checkpoint from {path}")
+        return model
 
 
 class Sarm(eqx.Module):
