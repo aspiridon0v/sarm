@@ -5,15 +5,19 @@ import jax.random as jr
 import numpy as np
 import optax
 import pytest
-from torch.utils.data import DataLoader, Dataset
+import torch
+from torch.utils.data import Dataset
 
-from sarm.model.clip import CLIP, load_tokenizer
-from sarm.model.sarm import ProgressTransformer, StageTransformer
+from sarm.model.clip import CLIP
+from sarm.model.sarm import ProgressTransformer, StageTransformer, Sarm, clip_inference
+from sarm.config.sarm_config import SarmConfig
 from sarm.scripts.train import (
-    clip_inference,
+    TrainContext,
+    eval_step,
     step_progress_transformer,
     step_stage_transformer,
 )
+from sarm.utils.tokenizer import load_tokenizer
 
 
 class DummyDataset(Dataset):
@@ -61,6 +65,11 @@ class DummyDataset(Dataset):
             "length": length,
             "progress_target": progress.astype(np.float32),
         }
+
+
+class DummyStateNormalizer:
+    def normalize(self, states):
+        return torch.tensor(states, dtype=torch.float32)
 
 
 @pytest.fixture
@@ -125,9 +134,11 @@ def test_process_transformer_step(sarm_modules, dummy_batch):
     texts = jnp.array(dummy_batch["text"])
     states = jnp.array(dummy_batch["state"])
     subtasks = jnp.array(dummy_batch["subtask"])
-    dense_schemas = jnp.array(dummy_batch["dense_schema"])
     lengths = jnp.array(dummy_batch["length"])
     progress_targets = jnp.array(dummy_batch["progress_target"])
+
+    dense_schema = True
+    key = jr.PRNGKey(42)
 
     # Extract features
     img_features, text_features = clip_inference(clip_model, images, texts)
@@ -144,10 +155,11 @@ def test_process_transformer_step(sarm_modules, dummy_batch):
         states,
         subtasks,
         lengths,
-        dense_schemas,
+        dense_schema,
         progress_targets,
         optimizer,
         opt_state,
+        key
     )
 
     # Assertions
@@ -179,8 +191,10 @@ def test_stage_transformer_step(sarm_modules, dummy_batch):
     texts = jnp.array(dummy_batch["text"])
     states = jnp.array(dummy_batch["state"])
     subtasks = jnp.array(dummy_batch["subtask"])
-    dense_schemas = jnp.array(dummy_batch["dense_schema"])
     lengths = jnp.array(dummy_batch["length"])
+
+    dense_schema = True
+    key = jr.PRNGKey(42)
 
     subtask_labels = jnp.argmax(subtasks, axis=-1).astype(jnp.int32)
 
@@ -199,9 +213,10 @@ def test_stage_transformer_step(sarm_modules, dummy_batch):
         states,
         subtask_labels,
         lengths,
-        dense_schemas,
+        dense_schema,
         optimizer,
         opt_state,
+        key,
     )
 
     # Assertions
@@ -247,9 +262,11 @@ def test_process_transformer_overfitting(sarm_modules):
     texts = jnp.array(batch["text"])
     states = jnp.array(batch["state"])
     subtasks = jnp.array(batch["subtask"])
-    dense_schemas = jnp.array(batch["dense_schema"])
     lengths = jnp.array(batch["length"])
     progress_targets = jnp.array(batch["progress_target"])
+
+    dense_schema = True
+    key = jr.PRNGKey(42)
 
     # Extract features once (fixed)
     img_features, text_features = clip_inference(clip_model, images, texts)
@@ -260,7 +277,8 @@ def test_process_transformer_overfitting(sarm_modules):
 
     # Train for multiple steps
     losses = []
-    for _ in range(50):
+    for i in range(50):
+        key, subkey = jr.split(key)
         process_transformer, opt_state, loss, _ = step_progress_transformer(
             process_transformer,
             img_features,
@@ -268,10 +286,11 @@ def test_process_transformer_overfitting(sarm_modules):
             states,
             subtasks,
             lengths,
-            dense_schemas,
+            dense_schema,
             progress_targets,
             optimizer,
             opt_state,
+            subkey,
         )
         losses.append(float(loss))
         print(f"Loss: {loss}")
@@ -305,8 +324,10 @@ def test_stage_transformer_overfitting(sarm_modules):
     texts = jnp.array(batch["text"])
     states = jnp.array(batch["state"])
     subtasks = jnp.array(batch["subtask"])  # (B, T, C)
-    dense_schemas = jnp.array(batch["dense_schema"])
     lengths = jnp.array(batch["length"])
+
+    dense_schema = True
+    key = jr.PRNGKey(42)
 
     subtask_labels = jnp.argmax(subtasks, axis=-1).astype(jnp.int32)  # (B)
 
@@ -320,7 +341,8 @@ def test_stage_transformer_overfitting(sarm_modules):
     # Train for multiple steps
     losses = []
     accuracies = []
-    for _ in range(50):
+    for i in range(50):
+        key, subkey = jr.split(key)
         stage_transformer, opt_state, loss, _, logits = step_stage_transformer(
             stage_transformer,
             img_features,
@@ -328,9 +350,10 @@ def test_stage_transformer_overfitting(sarm_modules):
             states,
             subtask_labels,
             lengths,
-            dense_schemas,
+            dense_schema,
             optimizer,
             opt_state,
+            subkey,
         )
         losses.append(float(loss))
         print(f"Loss: {loss}")
@@ -350,3 +373,34 @@ def test_stage_transformer_overfitting(sarm_modules):
 
     # For overfitting on 2 identical samples, we expect high accuracy eventually
     assert accuracies[-1] >= 0.5, f"Accuracy should improve. Final accuracy: {accuracies[-1]:.2f}"
+
+
+def test_eval_step(sarm_modules):
+    """Ensure eval_step runs without providing a PRNG key."""
+    process_transformer, stage_transformer, clip_model = sarm_modules
+    sarm_model = Sarm(
+        progress_transformer=process_transformer,
+        stage_transformer=stage_transformer,
+        clip_model=clip_model,
+    )
+
+    config = SarmConfig()
+    config.model_config.clip_preprocess_chunk_size = 4
+    tokenizer = load_tokenizer()
+    state_normalizer = DummyStateNormalizer()
+    ctx = TrainContext(config=config, tokenizer=tokenizer, state_normalizer=state_normalizer, dense_schema=True)
+
+    B, T = 2, 4
+    images = np.random.randn(B, T, 3, 32, 32).astype(np.float32)
+    batch = {
+        config.general_config.camera_names[0]: images,
+        "task": ["dummy task"] * B,
+        "observation.state": np.random.randn(B, T, config.model_config.state_dim).astype(np.float32),
+        "lengths": np.full((B,), T, dtype=np.int32),
+        "targets": np.tile(np.linspace(0.0, 1.0, T, dtype=np.float32), (B, 1)),
+    }
+
+    metrics = eval_step(batch=batch, sarm_model=sarm_model, ctx=ctx)
+
+    assert "total_loss" in metrics
+    assert np.isfinite(metrics["total_loss"])

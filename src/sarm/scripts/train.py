@@ -1,4 +1,7 @@
+import multiprocessing
+import os
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 
 import einops
@@ -10,6 +13,7 @@ import numpy as np
 import optax
 import torch
 from dotenv import load_dotenv
+from jaxtyping import PRNGKeyArray
 from tqdm import tqdm
 
 import wandb
@@ -17,40 +21,47 @@ from sarm.config.sarm_config import SarmConfig
 from sarm.dataset.data_utils import get_valid_episodes, split_train_eval_episodes
 from sarm.dataset.dataset import SarmDataset
 from sarm.dataset.normalizer import get_normalizer_from_calculated
-from sarm.model.clip import CLIP, load_clip_npz, preprocess_images_batch
-from sarm.model.sarm import ProgressTransformer, StageTransformer
-from sarm.utils.logging import setup_logger
+from sarm.model.clip import preprocess_images_batch
+from sarm.model.sarm import ProgressTransformer, StageTransformer, Sarm
+from sarm.utils.logger_setup import setup_logger
 from sarm.utils.tokenizer import load_tokenizer
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+class TrainContext:
+    """Holds preprocessing dependencies and config for training."""
+    def __init__(self, config: SarmConfig, tokenizer, state_normalizer, dense_schema: bool = False):
+        self.config = config
+        self.tokenizer = tokenizer
+        self.state_normalizer = state_normalizer
+        self.dense_schema = dense_schema
 
-@eqx.filter_jit
-def clip_inference(
-    clip_model: CLIP,
-    images: jax.Array,
-    text_tokens: jax.Array,
-):
-    """Extract features using CLIP model.
 
-    Args:
-        clip_model (CLIP): The CLIP model
-        images (jax.Array): Shape (B, N, T, C, H, W)
-        text_tokens (jax.Array): Shape (B, T, max_len)
+@dataclass
+class PreparedBatch:
+    """Container for shared train/eval batch data."""
+    img_features: jax.Array
+    text_features: jax.Array
+    states: jax.Array
+    lengths: jax.Array
+    gt_stage: jax.Array
+    gt_progress: jax.Array
+    dense_schema: bool
+    B: int
+    T: int
 
-    Returns:
-        img_features (jax.Array): Shape (B, N, T, d_vis)
-        text_features (jax.Array): Shape (B, T, d_text)
-    """
-    B, N, T, C, H, W = images.shape
-    images_reshaped = images.reshape((B * N * T, C, H, W))
-    img_features = jax.vmap(clip_model.encode_image)(images_reshaped)
-    img_features = img_features.reshape((B, N, T, -1))  # (B, N, T, d_vis)
 
-    text_features = jax.vmap(jax.vmap(clip_model.encode_text))(text_tokens)  # (B, T, d_text)
-    return img_features, text_features
+class OptState(eqx.Module):
+    """Training state holding optimizer-related data and lr schedule."""
+    progress_opt_state: optax.OptState
+    stage_opt_state: optax.OptState
+    step: int
+
+    # Static fields (not traced)
+    optimizer: optax.GradientTransformation = eqx.field(static=True)
+    lr_schedule: optax.Schedule = eqx.field(static=True)
 
 
 @eqx.filter_jit
@@ -61,10 +72,11 @@ def step_progress_transformer(
     state: jax.Array,
     subtask: jax.Array,
     length: jax.Array,
-    dense_schema: jax.Array,
+    dense_schema: bool,
     progress_targets: jax.Array,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
+    prog_key: PRNGKeyArray
 ):
     """Single training step for ProgressTransformer.
 
@@ -74,7 +86,7 @@ def step_progress_transformer(
         text_features (jax.Array): Shape (B, T, d_text)
         state_features (jax.Array): Shape (B, T, d_state)
         subtasks (jax.Array): Shape (B, T, C)
-        dense_schema (jax.Array): Shape (B,)
+        dense_schema (bool): Boolean if the schema is dense
         progress_targets (jax.Array): Shape (B, T)
     """
 
@@ -86,14 +98,16 @@ def step_progress_transformer(
         state,
         subtask,
         length,
-        dense_schema,
         progress_targets,
+        prog_key
     ):
+        B = img_features.shape[0]
+        prog_keys = jr.split(prog_key, B)
         pred_progress = jax.vmap(
             progress_transformer,
-            in_axes=(0, 0, 0, 0, 0, 0),
+            in_axes=(0, 0, 0, 0, 0, None, 0),
         )(
-            img_features, text_features, state, subtask, length, dense_schema
+            img_features, text_features, state, subtask, length, dense_schema, prog_keys
         )  # (B, T)
 
         loss = jnp.mean(jnp.square(pred_progress - progress_targets))
@@ -106,8 +120,8 @@ def step_progress_transformer(
         state,
         subtask,
         length,
-        dense_schema,
         progress_targets,
+        prog_key,
     )
     updates, opt_state = optimizer.update(grads, opt_state, progress_transformer)
     progress_transformer = eqx.apply_updates(progress_transformer, updates)
@@ -123,9 +137,10 @@ def step_stage_transformer(
     state_features: jax.Array,
     subtasks: jax.Array,
     length: jax.Array,
-    dense_schema: jax.Array,
+    dense_schema: bool,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
+    stage_key: PRNGKeyArray
 ):
     """Single training step for StageTransformer.
 
@@ -135,18 +150,18 @@ def step_stage_transformer(
         text_features (jax.Array): Shape (B, T, d_text)
         state_features (jax.Array): Shape (B, T, d_state)
         subtasks (jax.Array): Shape (B, T, C)
-        dense_schema (jax.Array): Shape (B,)
+        dense_schema (bool): Boolean if the schema is dense
     """
 
     @eqx.filter_value_and_grad(has_aux=True)
-    def loss_fn(
-        stage_transformer, img_features, text_features, state_features, length, dense_schema
-    ):
+    def loss_fn(stage_transformer, img_features, text_features, state_features, length, stage_key):
+        B = img_features.shape[0]
+        stage_keys = jr.split(stage_key, B)
         logits = jax.vmap(
             stage_transformer,
-            in_axes=(0, 0, 0, 0, 0),
+            in_axes=(0, 0, 0, 0, None, 0),
         )(
-            img_features, text_features, state_features, length, dense_schema
+            img_features, text_features, state_features, length, dense_schema, stage_keys
         )  # (B, T, C)
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits.reshape(-1, logits.shape[-1]),
@@ -155,7 +170,12 @@ def step_stage_transformer(
         return jnp.mean(loss), logits
 
     (loss, logits), grads = loss_fn(
-        stage_transformer, img_features, text_features, state_features, length, dense_schema
+        stage_transformer,
+        img_features,
+        text_features,
+        state_features,
+        length,
+        stage_key,
     )
     updates, opt_state = optimizer.update(grads, opt_state, stage_transformer)
     stage_transformer = eqx.apply_updates(stage_transformer, updates)
@@ -163,31 +183,107 @@ def step_stage_transformer(
     return stage_transformer, opt_state, loss, grads, logits
 
 
-def gen_stage_emb(self, num_classes, trg):
-    """
-    Returns stage_onehot with a modality dim (B, 1, T, C).
-    """
-    # integer part of float targets -> [0, C-1]
-    idx = trg.long().clamp(min=0, max=num_classes - 1)  # (B, T)
-    C = num_classes
-    # identity-lookup one-hot
-    stage_onehot = torch.eye(C, device=trg.device)[idx]  # (B, T, C)
-    stage_onehot = stage_onehot.unsqueeze(1)  # (B, 1, T, C)
-    return stage_onehot
+def preprocess_batch(batch, tokenizer, state_normalizer, config: SarmConfig, dense_schema: bool = False):
+    B, T = batch[config.general_config.camera_names[0]].shape[:2]
+
+    # Image Preprocessing
+    imgs_list = []
+    for key in config.general_config.camera_names:
+        imgs_list.append(batch[key])
+    imgs = np.stack(imgs_list, axis=0)  # N, B, T, C, H, W
+    imgs_preprocessed = preprocess_images_batch(
+        imgs, chunk_size=config.model_config.clip_preprocess_chunk_size
+    )
+    imgs_preprocessed = einops.rearrange(imgs_preprocessed, "n b t c h w -> b n t c h w")
+
+    # Text Preprocessing
+    text_str = batch["task"]  # B
+    text_tokens = einops.repeat(jnp.array(tokenizer(text_str)), "b s -> b t s", t=T)
+
+    # State Preprocessing
+    states = batch["observation.state"]  # B T D
+    states = jnp.array(state_normalizer.normalize(states).detach().numpy())
+
+    lengths = jnp.array(batch["lengths"])
+    progress = jnp.array(batch["targets"])
+
+    return {
+        "imgs_preprocessed": imgs_preprocessed,
+        "text_tokens": text_tokens,
+        "states": states,
+        "dense_schema": dense_schema,
+        "lengths": lengths,
+        "progress": progress,
+        "B": B,
+        "T": T,
+    }
 
 
-def train(config: SarmConfig):
+def prepare_batch(batch: dict, sarm_model: Sarm, ctx: TrainContext) -> PreparedBatch:
+    preprocessed = preprocess_batch(
+        batch=batch,
+        tokenizer=ctx.tokenizer,
+        state_normalizer=ctx.state_normalizer,
+        config=ctx.config,
+        dense_schema=ctx.dense_schema,
+    )
 
-    # Setup logger first
-    setup_logger(config, logger)
+    gt_stage = jnp.floor(preprocessed["progress"]).astype(jnp.int32)
+    gt_progress = jnp.remainder(preprocessed["progress"], 1.0)
 
-    # Set multiprocessing start method to avoid JAX fork() issues
-    # Must be called before creating DataLoaders with num_workers > 0
-    torch.multiprocessing.set_start_method("spawn", force=True)
+    img_features, text_features = sarm_model.clip_inference(
+        preprocessed["imgs_preprocessed"],
+        preprocessed["text_tokens"],
+        img_chunk_size=ctx.config.model_config.clip_preprocess_chunk_size,
+    )
 
+    return PreparedBatch(
+        img_features=img_features,
+        text_features=text_features,
+        states=preprocessed["states"],
+        lengths=preprocessed["lengths"],
+        gt_stage=gt_stage,
+        gt_progress=gt_progress,
+        dense_schema=preprocessed["dense_schema"],
+        B=preprocessed["B"],
+        T=preprocessed["T"],
+    )
+
+
+def log_train_metrics(info: dict, step: int, total_steps: int):
+    """Log training metrics to logger and wandb."""
+    info_logged = {k: (v.item() if hasattr(v, 'item') else v) for k, v in info.items()}
+    logger.info(
+        f"Step {step}/{total_steps} | "
+        f"Total Loss: {info_logged['train/total_loss']:.4f} | "
+        f"Stage Loss: {info_logged['train/stage_loss']:.4f} | "
+        f"Progress Loss: {info_logged['train/progress_loss']:.4f} | "
+        f"LR: {info_logged['train/lr']:.2e}"
+    )
+    wandb.log(info_logged, step=step)
+
+def log_eval_metrics(eval_metrics_list, step):
+    avg_metrics = {
+        f"val/{k}": float(np.mean([m[k] for m in eval_metrics_list]))
+        for k in eval_metrics_list[0].keys()
+    }
+
+    logger.info(
+        f"Validation Results - "
+        f"Total Loss: {avg_metrics['val/total_loss']:.4f} | "
+        f"Stage Loss: {avg_metrics['val/stage_loss']:.4f} | "
+        f"Progress Loss: {avg_metrics['val/progress_loss']:.4f} | "
+        f"Stage Acc: {avg_metrics['val/stage_acc']:.4f} | "
+        f"Total MAE: {avg_metrics['val/total_mae']:.4f}"
+    )
+    wandb.log(avg_metrics, step=step)
+
+
+def init_wandb(config):
     logger.info(
         f"Initializing wandb for project: {config.general_config.project_name}-{config.general_config.task_name}"  # noqa: E501
     )
+    assert 'WANDB_API_KEY' in os.environ
     wandb.init(
         project=f"{config.general_config.project_name}-{config.general_config.task_name}",
         name=f'{datetime.now().strftime("%Y.%m.%d-%H.%M.%S")}',
@@ -195,10 +291,7 @@ def train(config: SarmConfig):
         entity=config.general_config.wandb_entity,
     )
 
-    ###############################################################################################
-    #                                       Load Datasets                                         #
-    ###############################################################################################
-
+def load_dataset_sparse(config):
     logger.info("Loading datasets...")
     valid_episodes_sparse = get_valid_episodes(config.general_config.repo_id_sparse)
     logger.info(f"Found {len(valid_episodes_sparse)} valid sparse episodes")
@@ -210,6 +303,21 @@ def train(config: SarmConfig):
     logger.info(
         f"Split into {len(train_episodes_sparse)} train and {len(eval_episodes_sparse)} eval episodes"  # noqa: E501
     )
+    return train_episodes_sparse, eval_episodes_sparse
+
+
+def get_train_and_val_dataset_loader(config, train_episodes_sparse, eval_episodes_sparse):
+
+    def worker_init_fn(worker_id):
+        """Prevent DataLoader workers from initializing JAX"""
+        import os
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+
+    mp_context = None
+    if config.train_loader_config.num_workers > 0:
+        mp_context = multiprocessing.get_context("spawn")
 
     train_dataset_sparse = SarmDataset(
         repo_id=config.general_config.repo_id_sparse,
@@ -239,8 +347,11 @@ def train(config: SarmConfig):
         batch_size=config.train_loader_config.batch_size,
         shuffle=config.train_loader_config.shuffle,
         num_workers=config.train_loader_config.num_workers,
+        worker_init_fn=worker_init_fn,
+        drop_last=True,
+        multiprocessing_context=mp_context,
         # pin_memory=config.train_loader_config.pin_memory,
-        # persistent_workers=config.train_loader_config.persistant_workers,
+        persistent_workers=config.train_loader_config.persistant_workers > 0,
     )  # type: ignore
 
     # TODO: Separate config for val loader
@@ -249,60 +360,17 @@ def train(config: SarmConfig):
         batch_size=config.train_loader_config.batch_size,
         shuffle=config.train_loader_config.shuffle,
         num_workers=config.train_loader_config.num_workers,
+        worker_init_fn=worker_init_fn,
+        multiprocessing_context=mp_context,
+        persistent_workers=config.train_loader_config.persistant_workers > 0,
         # pin_memory=config.train_loader_config.pin_memory,
         # persistent_workers=config.train_loader_config.persistant_workers,
+        drop_last=True,
     )  # type: ignore
+    return train_loader, val_loader
 
-    state_normalizer = get_normalizer_from_calculated(config.general_config.state_norm_path, "cpu")
-    logger.info(f"Loaded state normalizer from {config.general_config.state_norm_path}")
-
-    tokenizer = load_tokenizer()
-    logger.info("Loaded tokenizer")
-
-    ###############################################################################################
-    #                                    Initialize Modules                                       #
-    ###############################################################################################
-
-    logger.info("Initializing models...")
-    progress_key, stage_key, clip_key = jr.split(jr.PRNGKey(config.general_config.seed), 3)
-
-    progress_transformer = ProgressTransformer(
-        d_model=config.model_config.d_model,
-        nheads=config.model_config.n_heads,
-        layers=config.model_config.n_layers,
-        num_cameras=len(config.general_config.camera_names),
-        state_dim=config.model_config.state_dim,
-        key=progress_key,
-    )
-    stage_transformer = StageTransformer(
-        d_model=config.model_config.d_model,
-        nheads=config.model_config.n_heads,
-        layers=config.model_config.n_layers,
-        num_cameras=len(config.general_config.camera_names),
-        state_dim=config.model_config.state_dim,
-        num_classes_sparse=len(config.model_config.sparse_annotation_list),
-        key=stage_key,
-    )
-    clip_model = load_clip_npz(CLIP(key=clip_key), config.model_config.clip_weights_path)
-    logger.info(f"Loaded CLIP model from {config.model_config.clip_weights_path}")
-
-    if config.model_config.resume_from_checkpoint:
-        assert (
-            config.model_config.progress_checkpoint_path is not None
-        ), "Progress checkpoint path is required"
-        assert (
-            config.model_config.stage_checkpoint_path is not None
-        ), "Stage checkpoint path is required"
-        progress_transformer.load_checkpoint(config.model_config.progress_checkpoint_path)
-        stage_transformer.load_checkpoint(config.model_config.stage_checkpoint_path)
-        logger.info(
-            f"Loaded checkpoint from {config.model_config.progress_checkpoint_path} and {config.model_config.stage_checkpoint_path}"  # noqa: E501
-        )
-
-    # Learning rate schedule: linear warmup + cosine annealing
-    logger.info(
-        f"Setting up optimizer with lr={config.optimizer_config.lr}, warmup_steps={config.optimizer_config.warmup_steps}"  # noqa: E501
-    )
+def create_optimizer(config: SarmConfig) -> tuple[optax.GradientTransformation, optax.Schedule]:
+    """Create optimizer and learning rate schedule from config."""
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.optimizer_config.lr,
@@ -311,7 +379,6 @@ def train(config: SarmConfig):
         end_value=0.0,
     )
 
-    # Optimizer with gradient clipping
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.train_config.grad_clip),
         optax.adamw(
@@ -323,151 +390,267 @@ def train(config: SarmConfig):
         ),
     )
 
-    progress_opt_state = optimizer.init(eqx.filter(progress_transformer, eqx.is_inexact_array))
-    stage_opt_state = optimizer.init(eqx.filter(stage_transformer, eqx.is_inexact_array))
+    return optimizer, lr_schedule
+
+
+def init_opt_state(
+    optimizer: optax.GradientTransformation,
+    lr_schedule: optax.Schedule,
+    sarm_model: Sarm,
+) -> OptState:
+    """Initialize training state from optimizer and model."""
+    progress_opt_state = optimizer.init(
+        eqx.filter(sarm_model.progress_transformer, eqx.is_inexact_array)
+    )
+    stage_opt_state = optimizer.init(
+        eqx.filter(sarm_model.stage_transformer, eqx.is_inexact_array)
+    )
+    return OptState(
+        progress_opt_state=progress_opt_state,
+        stage_opt_state=stage_opt_state,
+        step=0,
+        optimizer=optimizer,
+        lr_schedule=lr_schedule,
+    )
+
+def eval_step(batch: dict, sarm_model: Sarm, ctx: TrainContext):
+    """Evaluation step - no gradients, inference mode."""
+    # Put entire model in inference mode (handles dropout, etc.)
+    sarm_model_eval = eqx.nn.inference_mode(sarm_model)
+
+    prepared = prepare_batch(batch=batch, sarm_model=sarm_model_eval, ctx=ctx)
+
+    # Stage prediction (inference mode)
+    logits = sarm_model_eval.predict_stage(
+        img_features=prepared.img_features,
+        text_features=prepared.text_features,
+        state=prepared.states,
+        length=prepared.lengths,
+        dense_schema=prepared.dense_schema,
+        key=None,
+    )
+
+    # Use predicted stage for progress
+    stage_emb = jax.nn.one_hot(jnp.argmax(logits, axis=-1), num_classes=logits.shape[-1])
+
+    # Progress prediction (inference mode)
+    pred_progress = sarm_model_eval.predict_progress(
+        img_features=prepared.img_features,
+        text_features=prepared.text_features,
+        state=prepared.states,
+        stage_emb=stage_emb,
+        length=prepared.lengths,
+        dense_schema=prepared.dense_schema,
+        key=None,
+    )
+
+    # Compute losses
+    stage_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=logits.reshape(-1, logits.shape[-1]),
+        labels=prepared.gt_stage.reshape(-1),
+    )
+    stage_loss = jnp.mean(stage_loss)
+
+    progress_loss = jnp.mean(jnp.square(pred_progress - prepared.gt_progress))
+    total_loss = stage_loss + progress_loss
+
+    # Additional metrics
+    stage_acc = jnp.mean(
+        (jnp.argmax(logits, axis=-1) == prepared.gt_stage).astype(jnp.float32)
+    )
+    progress_mae = jnp.mean(jnp.abs(pred_progress - prepared.gt_progress))
+
+    # Combined prediction MAE
+    pred_combined = jnp.argmax(logits, axis=-1).astype(jnp.float32) + pred_progress
+    gt_combined = prepared.gt_stage.astype(jnp.float32) + prepared.gt_progress
+    total_mae = jnp.mean(jnp.abs(pred_combined - gt_combined))
+
+    return {
+        "stage_loss": float(stage_loss),
+        "progress_loss": float(progress_loss),
+        "total_loss": float(total_loss),
+        "stage_acc": float(stage_acc),
+        "progress_mae": float(progress_mae),
+        "total_mae": float(total_mae),
+    }
+
+def train_step(
+    batch: dict,
+    sarm_model: Sarm,
+    opt_state: OptState,
+    ctx: TrainContext,
+    train_key: PRNGKeyArray,
+):
+    train_key, stage_key, prog_key = jr.split(train_key, 3)
+
+    batch_pre = prepare_batch(batch=batch, sarm_model=sarm_model, ctx=ctx)
+
+    # Stage transformer training step
+    stage_transformer, stage_opt_state, stage_loss, stage_grads, logits = (
+        step_stage_transformer(
+            sarm_model.stage_transformer,
+            batch_pre.img_features,
+            batch_pre.text_features,
+            batch_pre.states,
+            batch_pre.gt_stage,
+            batch_pre.lengths,
+            batch_pre.dense_schema,
+            opt_state.optimizer,
+            opt_state.stage_opt_state,
+            stage_key,
+        )
+    )
+
+    # Stage embedding with teacher forcing (75% GT, 25% predicted)
+    if torch.rand(1).item() < 0.75:
+        stage_emb = jax.nn.one_hot(
+            batch_pre.gt_stage,
+            num_classes=len(ctx.config.model_config.sparse_annotation_list),
+        )
+    else:
+        stage_emb = jax.nn.one_hot(
+            jnp.argmax(logits, axis=-1), num_classes=logits.shape[-1], axis=-1
+        )
+
+    # Progress transformer training step
+    progress_transformer, progress_opt_state, progress_loss, progress_grads = (
+        step_progress_transformer(
+            sarm_model.progress_transformer,
+            batch_pre.img_features,
+            batch_pre.text_features,
+            batch_pre.states,
+            stage_emb,
+            batch_pre.lengths,
+            batch_pre.dense_schema,
+            batch_pre.gt_progress,
+            opt_state.optimizer,
+            opt_state.progress_opt_state,
+            prog_key,
+        )
+    )
+
+    # Stage prediction quality
+    stage_preds = jnp.argmax(logits, axis=-1)
+    stage_accuracy = float(
+        jnp.mean((stage_preds == batch_pre.gt_stage).astype(jnp.float32))
+    )
+
+    info = {
+        "train/stage_loss": stage_loss,
+        "train/progress_loss": progress_loss,
+        "train/total_loss": (stage_loss + progress_loss),
+        "train/stage_grad_norm": optax.global_norm(stage_grads),
+        "train/progress_grad_norm": optax.global_norm(progress_grads),
+        "train/lr": opt_state.lr_schedule(opt_state.step),
+        "train/stage_accuracy": stage_accuracy,
+    }
+
+    # Update model with trained transformers
+    new_model = eqx.tree_at(
+        lambda m: (m.stage_transformer, m.progress_transformer),
+        sarm_model,
+        (stage_transformer, progress_transformer),
+    )
+
+    # Update optimizer state
+    new_opt_state = OptState(
+        progress_opt_state=progress_opt_state,
+        stage_opt_state=stage_opt_state,
+        step=opt_state.step + 1,
+        optimizer=opt_state.optimizer,
+        lr_schedule=opt_state.lr_schedule,
+    )
+
+    return new_model, new_opt_state, train_key, info
+
+def get_next_batch(data_iter, data_loader):
+    try:
+        batch = next(data_iter)
+    except StopIteration:
+        train_iter = iter(data_loader)
+        batch = next(train_iter)
+    return batch
+
+def train(config: SarmConfig):
+    setup_logger(config, logger)
+    init_wandb(config)
+    train_episodes_sparse, eval_episodes_sparse = load_dataset_sparse(config)
+    train_loader, val_loader = get_train_and_val_dataset_loader(
+        config,
+        train_episodes_sparse=train_episodes_sparse,
+        eval_episodes_sparse=eval_episodes_sparse,
+    )
+    train_iter = iter(train_loader)
+    eval_iter = iter(val_loader)
+    logger.info("Initialized data loader")
+
+    state_normalizer = get_normalizer_from_calculated(config.general_config.state_norm_path, "cpu")
+    logger.info(f"Loaded state normalizer from {config.general_config.state_norm_path}")
+
+    tokenizer = load_tokenizer()
+    logger.info("Loaded tokenizer")
+
+    ctx = TrainContext(
+        config=config,
+        tokenizer=tokenizer,
+        state_normalizer=state_normalizer,
+        dense_schema=False,  # TODO: make configurable
+    )
+
+    logger.info("Initializing models...")
+    model_key, train_key = jr.split(jr.PRNGKey(config.general_config.seed), 2)
+
+    sarm_model = Sarm.init_sarm_from_config(config=config, key=model_key)
+
+    if config.model_config.resume_from_checkpoint:
+        sarm_model.load_checkpoint(
+            stage_checkpoint_path=config.model_config.stage_checkpoint_path,
+            progress_checkpoint_path=config.model_config.progress_checkpoint_path,
+        )
+
+    logger.info(
+        f"Setting up optimizer with lr={config.optimizer_config.lr}, "
+        f"warmup_steps={config.optimizer_config.warmup_steps}"
+    )
+
+    optimizer, lr_schedule = create_optimizer(config)
+    opt_state = init_opt_state(optimizer, lr_schedule, sarm_model)
     logger.info("Optimizer states initialized")
 
-    def train_step(
-        batch: dict,
-        progress_transformer: ProgressTransformer,
-        stage_transformer: StageTransformer,
-        progress_opt_state: optax.OptState,
-        stage_opt_state: optax.OptState,
-        step: int,
-    ):
-        B, T = batch[config.general_config.camera_names[0]].shape[:2]
+    # TRAIN LOOP
+    for _ in (pbar:= tqdm(range(config.optimizer_config.total_steps), desc="Training", unit="step")):
+        batch = get_next_batch(train_iter, train_loader)
 
-        # Image Preprocessing
-        imgs_list = []
-        for key in config.general_config.camera_names:
-            imgs_list.append(batch[key])
-        imgs = np.stack(imgs_list, axis=0)  # N, B, T, C, H, W
-        imgs_preprocessed = preprocess_images_batch(imgs)
-        imgs_preprocessed = einops.rearrange(imgs_preprocessed, "n b t c h w -> b n t c h w")
-
-        # Text Preprocessing
-        text_str = batch["task"]  # B
-        text_tokens = einops.repeat(jnp.array(tokenizer(text_str)), "b s -> b t s", t=T)
-
-        # State Preprocessing
-        states = batch["observation.state"]  # B T D
-        states = jnp.array(state_normalizer.normalize(states).detach().numpy())
-
-        dense_schemas = jnp.array([False for _ in range(B)])
-        lengths = jnp.array(batch["lengths"])
-        progress = jnp.array(batch["targets"])
-        gt_stage = jnp.floor(progress).astype(jnp.int32)
-        gt_progress = jnp.remainder(progress, 1.0)
-
-        img_features, text_features = clip_inference(clip_model, imgs_preprocessed, text_tokens)
-
-        stage_transformer, stage_opt_state, stage_loss, stage_grads, logits = (
-            step_stage_transformer(
-                stage_transformer,
-                img_features,
-                text_features,
-                states,
-                gt_stage,
-                lengths,
-                dense_schemas,
-                optimizer,
-                stage_opt_state,
-            )
+        sarm_model, opt_state, train_key, info = train_step(
+            batch=batch,
+            sarm_model=sarm_model,
+            opt_state=opt_state,
+            ctx=ctx,
+            train_key=train_key,
         )
+        pbar.set_postfix({"total_loss": f"{info['train/total_loss']:.4f}", "lr": f"{info['train/lr']:.2e}"})
 
-        if torch.rand(1).item() < 0.75:
-            # Mode 1: ground truth trg → one-hot
-            stage_emb = jax.nn.one_hot(
-                gt_stage, num_classes=len(config.model_config.sparse_annotation_list)
-            )
-        else:
-            # Mode 2: predicted argmax → one-hot
-            stage_emb = jax.nn.one_hot(
-                jnp.argmax(logits, axis=-1), num_classes=logits.shape[-1], axis=-1
-            )
+        if opt_state.step % config.train_config.log_every == 0:
+            log_train_metrics(info, opt_state.step, config.optimizer_config.total_steps)
 
-        progress_transformer, progress_opt_state, progress_loss, progress_grads = (
-            step_progress_transformer(
-                progress_transformer,
-                img_features,
-                text_features,
-                states,
-                stage_emb,
-                lengths,
-                dense_schemas,
-                gt_progress,
-                optimizer,
-                progress_opt_state,
-            )
-        )
+        if opt_state.step % config.train_config.eval_every == 0 and opt_state.step > 0:
+            logger.info('Evaluating on validation set...')
+            eval_metrics_list = []
+            num_eval_batches = min(10, len(val_loader))
 
-        info = {
-            "train/stage_loss": stage_loss.item(),
-            "train/progress_loss": progress_loss.item(),
-            "train/total_loss": (stage_loss + progress_loss).item(),
-            "train/stage_grad_norm": optax.global_norm(stage_grads).item(),
-            "train/progress_grad_norm": optax.global_norm(progress_grads).item(),
-            "train/lr": lr_schedule(step).item(),
-        }
-
-        return stage_transformer, progress_transformer, progress_opt_state, stage_opt_state, info
-
-    step = 0
-    train_iter = iter(train_loader)
-
-    logger.info(f"Starting training for {config.optimizer_config.total_steps} steps...")
-
-    # Create progress bar
-    pbar = tqdm(total=config.optimizer_config.total_steps, desc="Training", unit="step")
-
-    while True:
-        batch = next(train_iter)
-        stage_transformer, progress_transformer, progress_opt_state, stage_opt_state, info = (
-            train_step(
-                batch,
-                progress_transformer,
-                stage_transformer,
-                progress_opt_state,
-                stage_opt_state,
-                step=step,
-            )
-        )
-
-        # Update progress bar with metrics
-        pbar.set_postfix(
-            {"total_loss": f"{info['train/total_loss']:.4f}", "lr": f"{info['train/lr']:.2e}"}
-        )
-        pbar.update(1)
-
-        # Log training metrics (less frequently to avoid clutter)
-        if step % config.train_config.log_every == 0:
-            logger.info(
-                f"Step {step}/{config.optimizer_config.total_steps} | "
-                f"Total Loss: {info['train/total_loss']:.4f} | "
-                f"Stage Loss: {info['train/stage_loss']:.4f} | "
-                f"Progress Loss: {info['train/progress_loss']:.4f} | "
-                f"LR: {info['train/lr']:.2e}"
-            )
-            wandb.log(info)
-
-        step += 1
+            for _ in range(num_eval_batches):
+                eval_batch = get_next_batch(eval_iter, val_loader)
+                metrics = eval_step(batch=eval_batch, sarm_model=sarm_model, ctx=ctx)
+                eval_metrics_list.append(metrics)
+            log_eval_metrics(eval_metrics_list=eval_metrics_list, step=opt_state.step)
 
         if (
-            step % config.train_config.save_every == 0
-            or step == config.optimizer_config.total_steps
+            opt_state.step % config.train_config.save_every == 0
+            or opt_state.step == config.optimizer_config.total_steps
         ):
-            datetime_str = datetime.now().strftime("%Y.%m.%d-%H.%M.%S")
-            progress_transformer.save_checkpoint(
-                f"checkpoints/prg_t-{datetime_str}-s-{step}-b{config.train_loader_config.batch_size}.eqx"
-            )
-            stage_transformer.save_checkpoint(
-                f"checkpoints/stg_t-{datetime_str}-s-{step}-b{config.train_loader_config.batch_size}.eqx"
-            )
+            sarm_model.save_model(step=opt_state.step, config=config)
 
-        if step == config.optimizer_config.total_steps:
-            pbar.close()
-            logger.info("Training completed!")
-            break
+    logger.info("Training completed!")
 
 
 if __name__ == "__main__":

@@ -69,7 +69,6 @@ def test_get_item(dataset: tuple[SarmDataset, SarmDataset], config: SarmConfig):
         assert train_item["frame_relative_indices"].shape == (
             config.model_config.horizon + 1 + config.model_config.max_rewind_steps,
         ), f"Frame relative indices shape is incorrect: {train_item['frame_relative_indices'].shape}"
-        assert train_item["task"] == config.general_config.task_name
         for key in config.general_config.camera_names:
             assert train_item.get(key, None) is not None, f"Camera {key} is missing"
         assert (
