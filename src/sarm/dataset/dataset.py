@@ -113,7 +113,7 @@ class SarmDataset(LeRobotDataset):
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
         assert ep_idx in self.episodes, f"Episode {ep_idx} not found in the selected episodes."
-        
+
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
@@ -122,9 +122,7 @@ class SarmDataset(LeRobotDataset):
         required_history = self.n_obs_steps * self.frame_gap
 
         # Compute frame indices for observation
-        obs_indices = self.get_frame_indices(
-            idx, self.n_obs_steps, self.frame_gap, ep_start, ep_end
-        )
+        obs_indices = self.get_frame_indices(idx, self.n_obs_steps, self.frame_gap, ep_start, ep_end)
 
         # Convert absolute indices to relative indices for filtered dataset
         if self._absolute_to_relative_idx is not None:
@@ -165,15 +163,11 @@ class SarmDataset(LeRobotDataset):
                 frames = torch.cat([frames, pad_frame], dim=0)
 
             if rewind_flag:
-                rewind_step, rewind_frames = self._get_rewind(
-                    idx, key, ep_idx, rewind_step=rewind_step
-                )
+                rewind_step, rewind_frames = self._get_rewind(idx, key, ep_idx, rewind_step=rewind_step)
                 frames = torch.cat([frames, rewind_frames], dim=0)
             else:
                 rewind_step = 0
-                padding_frames = torch.zeros(
-                    (self.max_rewind_steps, *frames.shape[1:]), dtype=frames.dtype
-                )
+                padding_frames = torch.zeros((self.max_rewind_steps, *frames.shape[1:]), dtype=frames.dtype)
                 frames = torch.cat([frames, padding_frames], dim=0)
 
             seq_item[key] = frames
@@ -196,37 +190,27 @@ class SarmDataset(LeRobotDataset):
             seq_item["task"] = self.task
 
         # Progress targets
-        seq_item["targets"] = torch.zeros(
-            1 + self.n_obs_steps + self.max_rewind_steps, dtype=torch.float32
-        )
+        seq_item["targets"] = torch.zeros(1 + self.n_obs_steps + self.max_rewind_steps, dtype=torch.float32)
         state_with_rewind = torch.zeros(
             [1 + self.n_obs_steps + self.max_rewind_steps, seq_item["observation.state"].shape[-1]],
             dtype=torch.float32,
         )
         state_with_rewind[: self.n_obs_steps + 1, :] = seq_item["observation.state"]
-        frame_relative_indices = torch.zeros(
-            1 + self.n_obs_steps + self.max_rewind_steps, dtype=torch.float32
-        )
+        frame_relative_indices = torch.zeros(1 + self.n_obs_steps + self.max_rewind_steps, dtype=torch.float32)
 
         if not pertube_task_flag:
             seq_item["targets"][: self.n_obs_steps + 1] = progress_list
             for i in range(rewind_step):
-                seq_item["targets"][1 + self.n_obs_steps + i] = torch.flip(progress_list, dims=[0])[
-                    i + 1
-                ]
+                seq_item["targets"][1 + self.n_obs_steps + i] = torch.flip(progress_list, dims=[0])[i + 1]
 
         for i, idx in enumerate(obs_indices):
-            frame_relative_indices[i] = (
-                (idx - ep_start) / (ep_end - ep_start) if ep_end > ep_start else 0.0
-            )
+            frame_relative_indices[i] = (idx - ep_start) / (ep_end - ep_start) if ep_end > ep_start else 0.0
 
         for i in range(rewind_step):
             frame_relative_indices[1 + self.n_obs_steps + i] = torch.flip(
                 frame_relative_indices[: self.n_obs_steps + 1], dims=[0]
             )[i + 1]
-            state_with_rewind[1 + self.n_obs_steps + i, :] = torch.flip(
-                seq_item["observation.state"], dims=[0]
-            )[i + 1]
+            state_with_rewind[1 + self.n_obs_steps + i, :] = torch.flip(seq_item["observation.state"], dims=[0])[i + 1]
 
         seq_item["observation.state"] = state_with_rewind
         seq_item["lengths"] = torch.tensor(1 + self.n_obs_steps + rewind_step, dtype=torch.int32)
@@ -234,9 +218,7 @@ class SarmDataset(LeRobotDataset):
 
         if self.dense_annotation:
             if pertube_task_flag:
-                seq_item["task"] = [seq_item["task"]] * (
-                    1 + self.n_obs_steps + self.max_rewind_steps
-                )
+                seq_item["task"] = [seq_item["task"]] * (1 + self.n_obs_steps + self.max_rewind_steps)
             else:
                 seq_item["task"] = [""] * (1 + self.n_obs_steps + self.max_rewind_steps)
                 # Five-staged task annotation
@@ -257,12 +239,8 @@ class SarmDataset(LeRobotDataset):
 
         return seq_item
 
-    def _get_rewind(
-        self, idx: int, key: str, ep_idx: int, rewind_step=None
-    ) -> Tuple[int, torch.Tensor]:
-        assert (
-            self.max_rewind_steps < self.n_obs_steps
-        ), "Max rewind steps must be less than n_obs_steps."
+    def _get_rewind(self, idx: int, key: str, ep_idx: int, rewind_step=None) -> Tuple[int, torch.Tensor]:
+        assert self.max_rewind_steps < self.n_obs_steps, "Max rewind steps must be less than n_obs_steps."
 
         max_valid_step = (idx - self.frame_gap) // self.frame_gap
         max_rewind = min(self.max_rewind_steps, max_valid_step)

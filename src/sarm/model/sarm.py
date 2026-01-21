@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 @eqx.filter_jit
 def clip_inference(
-        clip_model: CLIP,
-        images: jax.Array,
-        text_tokens: jax.Array,
-        img_chunk_size: int = 64,  # Adjust based on your GPU VRAM (64-128 is usually safe)
-        text_chunk_size: int = 512,
+    clip_model: CLIP,
+    images: jax.Array,
+    text_tokens: jax.Array,
+    img_chunk_size: int = 64,  # Adjust based on your GPU VRAM (64-128 is usually safe)
+    text_chunk_size: int = 512,
 ):
     """
     Memory-efficient CLIP inference using internal micro-batching.
@@ -35,7 +35,7 @@ def clip_inference(
     img_features = _batched_forward(
         lambda x: clip_model.encode_image_batch(x),  # Function to apply to each chunk
         images_reshaped,
-        img_chunk_size
+        img_chunk_size,
     )
 
     # Reshape back: (B, N, T, d_vis)
@@ -46,17 +46,14 @@ def clip_inference(
     text_tokens_reshaped = text_tokens.reshape((B * T, -1))
 
     # Apply model in chunks (Text is lighter, can use larger chunks)
-    text_features = _batched_forward(
-        lambda x: clip_model.encode_text_batch(x),
-        text_tokens_reshaped,
-        text_chunk_size
-    )
+    text_features = _batched_forward(lambda x: clip_model.encode_text_batch(x), text_tokens_reshaped, text_chunk_size)
 
     # Reshape back: (B, T, d_text)
     text_features = text_features.reshape((B, T, -1))
 
     # Stop gradients to save memory and ensure safety
     return jax.lax.stop_gradient(img_features), jax.lax.stop_gradient(text_features)
+
 
 def _batched_forward(apply_fn: Callable, inputs: jax.Array, batch_size: int) -> jax.Array:
     """Chunk-processes a large tensor using jax.lax.map.
@@ -71,7 +68,7 @@ def _batched_forward(apply_fn: Callable, inputs: jax.Array, batch_size: int) -> 
 
     # Pad the inputs
     pad_width = [(0, pad_amt)] + [(0, 0)] * (inputs.ndim - 1)
-    inputs_padded = jnp.pad(inputs, pad_width, mode='edge')
+    inputs_padded = jnp.pad(inputs, pad_width, mode="edge")
 
     # Reshape into (Num_Chunks, Batch_Size, ...)
     input_chunks = inputs_padded.reshape((num_chunks, batch_size, *inputs.shape[1:]))
@@ -182,7 +179,7 @@ class ProgressTransformer(eqx.Module):
         subtask: jax.Array,
         length: int,
         dense_schema: jax.Array,
-        key: PRNGKeyArray | None = None
+        key: PRNGKeyArray | None = None,
     ):
         """Forward pass for the subtask transformer.
 
@@ -214,7 +211,7 @@ class ProgressTransformer(eqx.Module):
         mask = self._build_mask(T, length, N)  # ((N+3)*T, (N+3)*T)
 
         # Apply transformer blocks
-        keys = jr.split(key, len(self.blocks)) if key is not None else [None]*len(self.blocks)
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for n, block in enumerate(self.blocks):
             features = block(features, mask, key=keys[n])
 
@@ -307,7 +304,7 @@ class StageTransformer(eqx.Module):
         state: jax.Array,
         length: int,
         dense_schema: jax.Array,
-        key: PRNGKeyArray | None = None
+        key: PRNGKeyArray | None = None,
     ):
         """Forward pass for the stage transformer.
 
@@ -326,9 +323,7 @@ class StageTransformer(eqx.Module):
         state_features = jax.vmap(self.state_proj)(state)[None, ...]  # (1, T, d_model)
 
         # Combine features
-        features = jnp.concatenate(
-            [img_features, text_features, state_features], axis=0
-        )  # (N + 2, T, d_model)
+        features = jnp.concatenate([img_features, text_features, state_features], axis=0)  # (N + 2, T, d_model)
 
         features = features.at[:N, 0, :].add(self.positional_embedding)
         features = einops.rearrange(features, "n t d -> (n t) d")  # ((N+2)*T, d_model)
@@ -337,16 +332,14 @@ class StageTransformer(eqx.Module):
 
         # Apply transformer blocks
         # Apply transformer blocks
-        keys = jr.split(key, len(self.blocks)) if key is not None else [None]*len(self.blocks)
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for n, block in enumerate(self.blocks):
             features = block(features, mask, key=keys[n])
 
         features = einops.rearrange(features, "(n t) d -> t (n d)", n=N + 2, t=T)
         features = jax.vmap(self.fusion_mlp)(features)  # (T, d_model)
 
-        logits = jax.vmap(self.final_proj["dense"])(
-            features
-        )  # (T, C) TODO: add conditional sparse projection
+        logits = jax.vmap(self.final_proj["dense"])(features)  # (T, C) TODO: add conditional sparse projection
 
         return logits  # (T, C)
 
@@ -383,11 +376,7 @@ class Sarm(eqx.Module):
         img_chunk_size: int = 64,
         text_chunk_size: int = 512,
     ) -> tuple[jax.Array, jax.Array]:
-        return clip_inference(self.clip_model,
-                              images,
-                              text_tokens,
-                              img_chunk_size,
-                              text_chunk_size)
+        return clip_inference(self.clip_model, images, text_tokens, img_chunk_size, text_chunk_size)
 
     def predict_stage(
         self,
@@ -489,23 +478,14 @@ class Sarm(eqx.Module):
         """
         stage_key, prog_key = jr.split(key) if key is not None else (None, None)
 
-        img_features, text_features = self.clip_inference(
-            images, text_tokens, img_chunk_size=img_chunk_size
-        )
+        img_features, text_features = self.clip_inference(images, text_tokens, img_chunk_size=img_chunk_size)
 
-        stage_logits = self.predict_stage(
-            img_features, text_features, state, length, dense_schema, stage_key
-        )
+        stage_logits = self.predict_stage(img_features, text_features, state, length, dense_schema, stage_key)
 
         # Use predicted stage for progress prediction
-        stage_emb = jax.nn.one_hot(
-            jnp.argmax(stage_logits, axis=-1),
-            num_classes=stage_logits.shape[-1]
-        )
+        stage_emb = jax.nn.one_hot(jnp.argmax(stage_logits, axis=-1), num_classes=stage_logits.shape[-1])
 
-        progress = self.predict_progress(
-            img_features, text_features, state, stage_emb, length, dense_schema, prog_key
-        )
+        progress = self.predict_progress(img_features, text_features, state, stage_emb, length, dense_schema, prog_key)
 
         return {
             "img_features": img_features,
@@ -515,8 +495,8 @@ class Sarm(eqx.Module):
         }
 
     def load_checkpoint(self, progress_checkpoint_path, stage_checkpoint_path):
-        assert (progress_checkpoint_path is not None), "Progress checkpoint path is required"
-        assert (stage_checkpoint_path is not None), "Stage checkpoint path is required"
+        assert progress_checkpoint_path is not None, "Progress checkpoint path is required"
+        assert stage_checkpoint_path is not None, "Stage checkpoint path is required"
         self.progress_transformer = self.progress_transformer.load_checkpoint(progress_checkpoint_path)
         self.stage_transformer = self.stage_transformer.load_checkpoint(stage_checkpoint_path)
         logger.info(f"Loaded checkpoint from {progress_checkpoint_path} and {stage_checkpoint_path}")
@@ -547,9 +527,11 @@ class Sarm(eqx.Module):
         logger.info(f"Created SARM stage transformer")
         clip_model = load_clip_npz(CLIP(key=clip_key), config.model_config.clip_weights_path)
         logger.info(f"Loaded CLIP model from {config.model_config.clip_weights_path}")
-        return cls(progress_transformer=progress_transformer,
-                   stage_transformer=stage_transformer,
-                   clip_model=clip_model)
+        return cls(
+            progress_transformer=progress_transformer,
+            stage_transformer=stage_transformer,
+            clip_model=clip_model,
+        )
 
     def save_model(self, config, step):
         datetime_str = datetime.now().strftime("%Y.%m.%d-%H.%M.%S")

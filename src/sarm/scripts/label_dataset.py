@@ -45,6 +45,7 @@ Output Files:
        - Compatible with LeRobot's visualize_dataset.py script
        - FAST: Videos are copied directly without re-encoding (huge time savings!)
 """
+
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -57,11 +58,11 @@ from tqdm import tqdm
 
 
 class BoundaryPredictor:
-    def __init__(self, ep_starts, q=.2, min_samples=0):
+    def __init__(self, ep_starts, q=0.2, min_samples=0):
         self.ep_starts = ep_starts
         self.durations = defaultdict(list)
         self.q = q
-        self.min_samples=min_samples
+        self.min_samples = min_samples
 
     def update(self, boundaries):
         self.durations = defaultdict(list)
@@ -71,14 +72,13 @@ class BoundaryPredictor:
             for i, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
                 if i == 0:
                     self.durations[i].append(a[0] - self.ep_starts[ep_idx])
-                self.durations[i+1].append(b[0] -a[0]) 
-    
+                self.durations[i + 1].append(b[0] - a[0])
+
     def quantile_duration(self, durations):
         if durations == [] or len(durations) < self.min_samples:
             return 0
-        return int(np.quantile(durations,self.q))
-        
-        
+        return int(np.quantile(durations, self.q))
+
     def predict(self, current_bounds):
         if current_bounds == []:
             return self.quantile_duration(self.durations[0])
@@ -89,20 +89,23 @@ class BoundaryPredictor:
             return 0
         else:
             return self.quantile_duration(self.durations[next_id])
-    
+
     def predict_subtask_end(self, current_bounds, ep_start):
         last_idx = np.max([b[0] for b in current_bounds] + [ep_start])
         sub_taks_lengh = self.predict(current_bounds=current_bounds)
-        return int(sub_taks_lengh  + last_idx)
+        return int(sub_taks_lengh + last_idx)
 
 
 class DatasetLabeler:
     """Interactive labeler for robot datasets with subtask boundary annotation."""
 
-    def __init__(self, repo_id: str,
-                 task_names: List[str],
-                 camera_keys: List[str],
-                 boundaries:Optional[Dict[int, List[tuple]]]=None):
+    def __init__(
+        self,
+        repo_id: str,
+        task_names: List[str],
+        camera_keys: List[str],
+        boundaries: Optional[Dict[int, List[tuple]]] = None,
+    ):
         self.dataset = LeRobotDataset(repo_id=repo_id)
         self.task_names = task_names
         self.camera_keys = camera_keys
@@ -110,7 +113,6 @@ class DatasetLabeler:
 
         # Get episode information from lerobot dataset
         self.num_episodes = self.dataset.num_episodes
-
 
         print(f"Dataset loaded: {repo_id}")
         print(f"Number of episodes: {self.num_episodes}")
@@ -136,11 +138,11 @@ class DatasetLabeler:
 
     def get_episode_frames(self, episode_idx: int):
         """Get start and end frame indices for an episode."""
-        
+
         ep = self.dataset.meta.episodes[episode_idx]
         start_idx = ep["dataset_from_index"]
         end_idx = ep["dataset_to_index"]
-        
+
         return start_idx, end_idx
 
     def tensor_to_image(self, tensor: torch.Tensor) -> np.ndarray:
@@ -193,7 +195,6 @@ class DatasetLabeler:
             f"  Frame: {frame_in_episode}/{total_frames_in_episode-1} (Global: {self.current_frame})  |"
             f"  Status: {'PAUSED' if self.paused else 'PLAYING'}  |"
             f"  Speed: {self.playback_speed}x {'(Fast Mode)' if self.fast_mode else ''}"
-
         ]
 
         for i, text in enumerate(episode_info):
@@ -210,16 +211,12 @@ class DatasetLabeler:
         # Show boundaries for current episode in the top panel
         if self.current_episode in self.boundaries and self.boundaries[self.current_episode]:
             boundary_text = f"Marked boundaries:"
-            cv2.putText(
-                info_panel, boundary_text, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
-            )
+            cv2.putText(info_panel, boundary_text, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             for i, (frame_idx, subtask_idx) in enumerate(self.boundaries[self.current_episode]):
                 start_idx, _ = self.get_episode_frames(self.current_episode)
                 frame_in_ep = frame_idx - start_idx
-                boundary_info = (
-                    f"  {i+1}. Frame {frame_in_ep}: END '{self.task_names[subtask_idx]}'"
-                )
+                boundary_info = f"  {i+1}. Frame {frame_in_ep}: END '{self.task_names[subtask_idx]}'"
                 cv2.putText(
                     info_panel,
                     boundary_info,
@@ -301,9 +298,7 @@ class DatasetLabeler:
                 f"(Episode {self.current_episode})"
             )
             if subtask_idx + 1 < self.num_subtasks:
-                print(
-                    f"  → Next subtask '{self.task_names[subtask_idx + 1]}' starts at frame {self.current_frame + 1}"
-                )
+                print(f"  → Next subtask '{self.task_names[subtask_idx + 1]}' starts at frame {self.current_frame + 1}")
 
     def undo_last_boundary(self):
         if self.current_episode in self.boundaries and self.boundaries[self.current_episode]:
@@ -417,12 +412,7 @@ class DatasetLabeler:
 
         new_dataset = modify_features(
             dataset=self.dataset,
-            add_features={
-                "next.reward": (
-                    get_reward,
-                    {"dtype": "float32", "shape": (1,), "names": None}
-                )
-            },
+            add_features={"next.reward": (get_reward, {"dtype": "float32", "shape": (1,), "names": None})},
             output_dir=output_path,
             repo_id=dataset_name,
         )
@@ -476,7 +466,7 @@ class DatasetLabeler:
         task_names_map = {}  # Maps task name string -> subtask_idx
         current_episode = None
 
-        with open(metadata_path, 'r') as f:
+        with open(metadata_path, "r") as f:
             lines = f.readlines()
 
         # First pass: Parse the Subtasks section to build the task name mapping
@@ -491,7 +481,7 @@ class DatasetLabeler:
                 continue
 
             if in_subtasks_section and not in_boundaries_section:
-                subtask_match = re.match(r'\s*(\d+)\.\s+(.+)', line)
+                subtask_match = re.match(r"\s*(\d+)\.\s+(.+)", line)
                 if subtask_match:
                     subtask_idx = int(subtask_match.group(1))
                     task_name = subtask_match.group(2).strip()
@@ -508,7 +498,7 @@ class DatasetLabeler:
                 continue
 
             # Parse episode line: "  Episode 0:"
-            episode_match = re.match(r'\s*Episode (\d+):', line)
+            episode_match = re.match(r"\s*Episode (\d+):", line)
             if episode_match:
                 current_episode = int(episode_match.group(1))
                 boundaries[current_episode] = []
@@ -519,7 +509,7 @@ class DatasetLabeler:
                 continue
 
             # Parse boundary line: "    Frame 45 (global 123): END of 'Grasp right corner'"
-            boundary_match = re.match(r'\s*Frame \d+ \(global (\d+)\): END of \'(.+)\'', line)
+            boundary_match = re.match(r"\s*Frame \d+ \(global (\d+)\): END of \'(.+)\'", line)
             if boundary_match and current_episode is not None:
                 global_frame_idx = int(boundary_match.group(1))
                 task_name = boundary_match.group(2)
@@ -532,7 +522,6 @@ class DatasetLabeler:
                     print(f"Warning: Unknown task name '{task_name}' in boundaries section")
 
         return boundaries
-
 
     def run(self):
         """Main loop for interactive labeling."""
@@ -608,10 +597,10 @@ class DatasetLabeler:
                     if self.fast_mode:
                         predicted = self.predictor.predict_subtask_end(self.boundaries[self.current_episode], start_idx)
                         if predicted - self.current_frame > 15:
-                            self.playback_speed =  3
-                            
+                            self.playback_speed = 3
+
                     self.current_frame += self.playback_speed
-                    if self.current_frame >= end_idx:   
+                    if self.current_frame >= end_idx:
                         # Loop back or move to next episode
                         self.current_frame = start_idx
 
@@ -637,16 +626,16 @@ def main():
         "observation.images.right_wrist",
         "observation.images.topdown",
     ]
-    
+
     boundaries = None
     # Uncomment to load existing labels
     # boundaries = DatasetLabeler.load_boundaries_from_metadata('data/labeling_metadata.txt')
-    
+
     labeler = DatasetLabeler(
         repo_id="ETHRC/towel_base",
         task_names=TASK_NAMES,
         camera_keys=CAMERA_KEYS,
-        boundaries=boundaries
+        boundaries=boundaries,
     )
     labeler.run()
 

@@ -10,11 +10,12 @@ import numpy as np
 
 # Constants
 _CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-_CLIP_INV_STD = (1.0 / np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32))
+_CLIP_INV_STD = 1.0 / np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
 # Broadcast for NHWC layout (Batch, Height, Width, Channels)
 _CLIP_MEAN_NHWC = _CLIP_MEAN.reshape((1, 1, 1, 3))
 _CLIP_INV_STD_NHWC = _CLIP_INV_STD.reshape((1, 1, 1, 3))
+
 
 def quick_gelu(x):
     # Matches CLIP QuickGELU: x * sigmoid(1.702 * x)
@@ -61,10 +62,7 @@ def preprocess_image(image: Image.Image | np.ndarray) -> jax.Array:
 
 
 @functools.partial(jax.jit, static_argnames=("output_size",))
-def _preprocess_chunk_jit(
-        image_chunk: jax.Array,
-        output_size: tuple[int, int] = (224, 224)
-) -> jax.Array:
+def _preprocess_chunk_jit(image_chunk: jax.Array, output_size: tuple[int, int] = (224, 224)) -> jax.Array:
     """
     Processes a single fixed-size chunk on the GPU.
     Expected Input: (N, C, H, W) normalized [0, 1]
@@ -78,7 +76,8 @@ def _preprocess_chunk_jit(
     chunk = jax.image.resize(
         chunk,
         (chunk.shape[0], output_size[0], output_size[1], chunk.shape[3]),
-        method="bicubic", antialias=True
+        method="bicubic",
+        antialias=True,
     )
 
     # 3. Normalize (x - mean) / std
@@ -92,8 +91,8 @@ def _preprocess_chunk_jit(
 
 
 def preprocess_images_batch(
-        images: np.ndarray | jax.Array,
-        chunk_size: int = 256,
+    images: np.ndarray | jax.Array,
+    chunk_size: int = 256,
 ) -> jax.Array:
     """
     Memory-safe preprocessing. Handles inputs on CPU (NumPy) or GPU (JAX).
@@ -136,7 +135,7 @@ def preprocess_images_batch(
         if actual_batch_size < chunk_size:
             pad_amount = chunk_size - actual_batch_size
             # Pad with edge values or zeros. Edge is safer for artifacts.
-            chunk_jax = jnp.pad(chunk_jax, ((0, pad_amount), (0, 0), (0, 0), (0, 0)), mode='edge')
+            chunk_jax = jnp.pad(chunk_jax, ((0, pad_amount), (0, 0), (0, 0), (0, 0)), mode="edge")
 
         # Process on GPU
         processed_chunk = _preprocess_chunk_jit(chunk_jax)
@@ -194,10 +193,10 @@ class Attention(eqx.Module):
     head_dim: int
     scale: float
 
-    def __init__(self, d, nheads,  dropout=0, key=None):
+    def __init__(self, d, nheads, dropout=0, key=None):
         if key is None:
             key = jr.PRNGKey(0)
-        kq, kk, kv, ko= jr.split(key, 4)
+        kq, kk, kv, ko = jr.split(key, 4)
         self.q = eqx.nn.Linear(d, d, key=kq, use_bias=True)
         self.k = eqx.nn.Linear(d, d, key=kk, use_bias=True)
         self.v = eqx.nn.Linear(d, d, key=kv, use_bias=True)
@@ -286,9 +285,7 @@ class ViTB32(eqx.Module):
         if key is None:
             key = jr.PRNGKey(0)
         k_conv, k_cls, k_pos, k_proj, k_blocks = jr.split(key, 5)
-        self.patch = eqx.nn.Conv2d(
-            3, d, kernel_size=patch_size, stride=patch_size, use_bias=False, key=k_conv
-        )
+        self.patch = eqx.nn.Conv2d(3, d, kernel_size=patch_size, stride=patch_size, use_bias=False, key=k_conv)
         n = (image_size // patch_size) ** 2
         self.cls = jr.normal(k_cls, (1, d))
         self.pos = jr.normal(k_pos, (n + 1, d)) * 0.01
@@ -560,9 +557,7 @@ def load_vision_npz(model: ViTB32, path: str) -> ViTB32:
     # Final LN
     model = eqx.tree_at(lambda m: m.ln_pre.weight, model, jnp.asarray(data["visual.ln_pre.weight"]))
     model = eqx.tree_at(lambda m: m.ln_pre.bias, model, jnp.asarray(data["visual.ln_pre.bias"]))
-    model = eqx.tree_at(
-        lambda m: m.ln_post.weight, model, jnp.asarray(data["visual.ln_post.weight"])
-    )
+    model = eqx.tree_at(lambda m: m.ln_post.weight, model, jnp.asarray(data["visual.ln_post.weight"]))
     model = eqx.tree_at(lambda m: m.ln_post.bias, model, jnp.asarray(data["visual.ln_post.bias"]))
 
     # Projection (PyTorch stored as [768,512], Equinox uses the same matmul ordering cls @ proj)
@@ -662,15 +657,11 @@ def load_text_npz(model: TextTransformer, path: str) -> TextTransformer:
     model = eqx.tree_at(lambda m: m.blocks, model, blocks)
 
     # Final layer norm
-    model = eqx.tree_at(
-        lambda m: m.ln_final.weight, model, jnp.asarray(data["text.ln_final.weight"])
-    )
+    model = eqx.tree_at(lambda m: m.ln_final.weight, model, jnp.asarray(data["text.ln_final.weight"]))
     model = eqx.tree_at(lambda m: m.ln_final.bias, model, jnp.asarray(data["text.ln_final.bias"]))
 
     # Text projection
-    model = eqx.tree_at(
-        lambda m: m.text_projection, model, jnp.asarray(data["text.text_projection"])
-    )
+    model = eqx.tree_at(lambda m: m.text_projection, model, jnp.asarray(data["text.text_projection"]))
 
     return model
 

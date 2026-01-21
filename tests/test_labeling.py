@@ -82,8 +82,6 @@ def test_reward_computation():
         if len(ep_rewards) > 0 and not np.all(ep_rewards == 0):
             # Check if rewards are non-decreasing
             is_monotonic = np.all(np.diff(ep_rewards) >= 0)
-            print(
-                f"\nEpisode {ep}: rewards are {'monotonically increasing ✓' if is_monotonic else 'NOT monotonic ✗'}"
-            )
+            print(f"\nEpisode {ep}: rewards are {'monotonically increasing ✓' if is_monotonic else 'NOT monotonic ✗'}")
 
     print("\n" + "=" * 50)

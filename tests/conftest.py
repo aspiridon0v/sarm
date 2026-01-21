@@ -28,10 +28,12 @@ import pytest
 import torch
 from sarm.utils.convert_clip import main as export_clip_weights
 
+
 @pytest.fixture(scope="session")
 def clip_weight_path():
-    path = Path(__file__).parents[1] / 'checkpoints' / 'clip_vit_b32_openai.npz'
+    path = Path(__file__).parents[1] / "checkpoints" / "clip_vit_b32_openai.npz"
     return str(path)
+
 
 @pytest.fixture(scope="session")
 def ensure_weights(clip_weight_path):
@@ -40,6 +42,7 @@ def ensure_weights(clip_weight_path):
         export_clip_weights()
     assert os.path.exists(clip_weight_path), "Failed to export CLIP weights to .npz"
     return clip_weight_path
+
 
 def pytest_configure(config):
     """Configure JAX and PyTorch devices before running tests."""

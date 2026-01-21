@@ -73,6 +73,5 @@ def test_get_item(dataset: tuple[SarmDataset, SarmDataset], config: SarmConfig):
             assert train_item.get(key, None) is not None, f"Camera {key} is missing"
         assert (
             train_item["lengths"] >= config.model_config.horizon
-            and train_item["lengths"]
-            <= config.model_config.horizon + config.model_config.max_rewind_steps
+            and train_item["lengths"] <= config.model_config.horizon + config.model_config.max_rewind_steps
         ), f"Lengths is incorrect: {train_item['lengths']}"

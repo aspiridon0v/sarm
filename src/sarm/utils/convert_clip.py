@@ -33,9 +33,7 @@ def to_numpy(t):
 
 def main():
     # 1) Load ViT-B/32 CLIP model
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai", force_quick_gelu=True
-    )
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai", force_quick_gelu=True)
     model.eval()
 
     params = {}
@@ -72,9 +70,7 @@ def main():
 
     # Vision Transformer blocks
     for i, blk in enumerate(visual.transformer.resblocks):
-        (Wq, bq), (Wk, bk), (Wv, bv), (Wout, bout) = extract_qkv_and_out_from_mha(
-            blk.attn
-        )
+        (Wq, bq), (Wk, bk), (Wv, bv), (Wout, bout) = extract_qkv_and_out_from_mha(blk.attn)
         base = f"visual.blocks.{i}"
         params[f"{base}.attn.q.weight"] = Wq
         params[f"{base}.attn.q.bias"] = bq
@@ -106,20 +102,14 @@ def main():
     vocab_size = model.vocab_size  # 49408
 
     # Token embedding
-    params["text.token_embedding.weight"] = to_numpy(
-        model.token_embedding.weight
-    )  # (49408, 512)
+    params["text.token_embedding.weight"] = to_numpy(model.token_embedding.weight)  # (49408, 512)
 
     # Positional embedding
-    params["text.positional_embedding"] = to_numpy(
-        model.positional_embedding
-    )  # (77, 512)
+    params["text.positional_embedding"] = to_numpy(model.positional_embedding)  # (77, 512)
 
     # Text transformer blocks
     for i, blk in enumerate(model.transformer.resblocks):
-        (Wq, bq), (Wk, bk), (Wv, bv), (Wout, bout) = extract_qkv_and_out_from_mha(
-            blk.attn
-        )
+        (Wq, bq), (Wk, bk), (Wv, bv), (Wout, bout) = extract_qkv_and_out_from_mha(blk.attn)
         base = f"text.blocks.{i}"
         params[f"{base}.attn.q.weight"] = Wq
         params[f"{base}.attn.q.bias"] = bq

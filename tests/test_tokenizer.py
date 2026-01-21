@@ -55,9 +55,7 @@ def test_tokenizer_multiple_texts(openclip_tokenizer, custom_tokenizer):
     custom_tokens = custom_tokenizer(texts)
 
     # Should produce identical results
-    assert np.array_equal(
-        openclip_tokens, custom_tokens
-    ), "Tokens don't match for multiple texts"
+    assert np.array_equal(openclip_tokens, custom_tokens), "Tokens don't match for multiple texts"
 
 
 def test_tokenizer_empty_string(openclip_tokenizer, custom_tokenizer):

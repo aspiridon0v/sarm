@@ -14,9 +14,7 @@ def setup_logger(config: SarmConfig, logger: logging.Logger):
     log_level = getattr(logging, config.logging_config.level.upper(), logging.INFO)
 
     # Create formatter with custom format
-    formatter = logging.Formatter(
-        fmt=config.logging_config.format, datefmt=config.logging_config.date_format
-    )
+    formatter = logging.Formatter(fmt=config.logging_config.format, datefmt=config.logging_config.date_format)
 
     # Configure root logger
     root_logger = logging.getLogger()

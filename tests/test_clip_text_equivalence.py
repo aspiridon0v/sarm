@@ -12,13 +12,10 @@ from sarm.model.clip import CLIP, TextTransformer, load_clip_npz, load_text_npz
 from sarm.utils.convert_clip import main as export_clip_weights
 
 
-
 @pytest.fixture(scope="session")
 def pt_model_and_tokenizer(torch_device):
     """Load PyTorch CLIP ViT-B/32 (openai weights) and tokenizer."""
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai", force_quick_gelu=True
-    )
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai", force_quick_gelu=True)
     model.eval()
     model.to(torch_device)
     tokenizer = open_clip.get_tokenizer("ViT-B-32")
@@ -60,32 +57,22 @@ def test_text_weight_loading(pt_model_and_tokenizer, ensure_weights):
     pt_token_weight = model.token_embedding.weight.detach().cpu().numpy()
     eq_token_weight = np.array(eq_model.token_embedding.weight)
 
-    assert np.allclose(
-        pt_token_weight, eq_token_weight, atol=0, rtol=0
-    ), "Token embedding weights don't match"
+    assert np.allclose(pt_token_weight, eq_token_weight, atol=0, rtol=0), "Token embedding weights don't match"
 
     # Test positional embedding
     pt_pos_embed = model.positional_embedding.detach().cpu().numpy()
     eq_pos_embed = np.array(eq_model.positional_embedding)
 
-    assert np.allclose(
-        pt_pos_embed, eq_pos_embed, atol=0, rtol=0
-    ), "Positional embeddings don't match"
+    assert np.allclose(pt_pos_embed, eq_pos_embed, atol=0, rtol=0), "Positional embeddings don't match"
 
     # Test MLP weights in first block
-    pt_fc1_weight = (
-        model.transformer.resblocks[0].mlp.c_fc.weight.detach().cpu().numpy()
-    )
+    pt_fc1_weight = model.transformer.resblocks[0].mlp.c_fc.weight.detach().cpu().numpy()
     pt_fc1_bias = model.transformer.resblocks[0].mlp.c_fc.bias.detach().cpu().numpy()
     eq_fc1_weight = np.array(eq_model.blocks[0].mlp.fc1.weight)
     eq_fc1_bias = np.array(eq_model.blocks[0].mlp.fc1.bias)
 
-    assert np.allclose(
-        pt_fc1_weight, eq_fc1_weight, atol=0, rtol=0
-    ), "fc1 weights don't match"
-    assert np.allclose(
-        pt_fc1_bias, eq_fc1_bias, atol=0, rtol=0
-    ), "fc1 bias doesn't match"
+    assert np.allclose(pt_fc1_weight, eq_fc1_weight, atol=0, rtol=0), "fc1 weights don't match"
+    assert np.allclose(pt_fc1_bias, eq_fc1_bias, atol=0, rtol=0), "fc1 bias doesn't match"
 
 
 def test_text_features_match_pytorch(pt_model_and_tokenizer, ensure_weights):
@@ -194,9 +181,7 @@ def test_text_causal_attention(pt_model_and_tokenizer, ensure_weights):
     # Apply first transformer block
     with torch.no_grad():
         attn_mask = model.attn_mask[:seq_len, :seq_len]
-        x_pt_block = model.transformer.resblocks[0](
-            x_pt[None, :, :], attn_mask=attn_mask
-        )[0]
+        x_pt_block = model.transformer.resblocks[0](x_pt[None, :, :], attn_mask=attn_mask)[0]
 
     mask_eq = eq_model.attn_mask[:seq_len, :seq_len]
     x_eq_block = eq_model.blocks[0](x_eq, mask_eq)
@@ -409,9 +394,7 @@ def test_batched_text_encoding():
     )
 
     # Create random token sequences
-    texts = [
-        jnp.array([i] * 10 + [49407] + [0] * 66, dtype=jnp.int32) for i in range(1, 4)
-    ]
+    texts = [jnp.array([i] * 10 + [49407] + [0] * 66, dtype=jnp.int32) for i in range(1, 4)]
 
     # Process each text
 

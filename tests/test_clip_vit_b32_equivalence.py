@@ -17,9 +17,7 @@ from sarm.utils.convert_clip import main as export_clip_weights
 def pt_model_and_preprocess(torch_device):
     # Load PyTorch CLIP ViT-B/32 (openai weights) and its official preprocess
     # Force quick_gelu=True to match the original OpenAI training
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai", force_quick_gelu=True
-    )
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai", force_quick_gelu=True)
     model.eval()
     model.to(torch_device)
     return model, preprocess, torch_device
@@ -45,14 +43,8 @@ def _make_test_images():
 def _torch_forward_visual(model, imgs_pt):
     with torch.no_grad():
         out = model.visual(imgs_pt)  # Expect (B, 512)
-    if (
-        not isinstance(out, torch.Tensor)
-        or out.ndim != 2
-        or out.shape[-1] != model.visual.output_dim
-    ):
-        raise RuntimeError(
-            f"Unexpected visual forward output shape: {getattr(out, 'shape', None)}"
-        )
+    if not isinstance(out, torch.Tensor) or out.ndim != 2 or out.shape[-1] != model.visual.output_dim:
+        raise RuntimeError(f"Unexpected visual forward output shape: {getattr(out, 'shape', None)}")
     return out
 
 
@@ -66,9 +58,7 @@ def test_vit_b32_image_features_match_pytorch(pt_model_and_preprocess, ensure_we
 
     # ----- Make two test images and preprocess with official transforms -----
     pil_imgs = _make_test_images()
-    imgs_pt = torch.stack([preprocess(im.convert("RGB")) for im in pil_imgs], dim=0).to(
-        torch_device
-    )  # (B,3,224,224)
+    imgs_pt = torch.stack([preprocess(im.convert("RGB")) for im in pil_imgs], dim=0).to(torch_device)  # (B,3,224,224)
 
     # ----- PyTorch path -----
     pt_feat = _torch_forward_visual(model, imgs_pt).cpu().numpy()  # (B,512)
@@ -104,22 +94,14 @@ def test_weight_loading(pt_model_and_preprocess, ensure_weights):
     eq_model = load_vision_npz(eq_model, ensure_weights)
 
     # Test MLP weights in first block
-    pt_fc1_weight = (
-        pt_visual.transformer.resblocks[0].mlp.c_fc.weight.detach().cpu().numpy()
-    )
-    pt_fc1_bias = (
-        pt_visual.transformer.resblocks[0].mlp.c_fc.bias.detach().cpu().numpy()
-    )
+    pt_fc1_weight = pt_visual.transformer.resblocks[0].mlp.c_fc.weight.detach().cpu().numpy()
+    pt_fc1_bias = pt_visual.transformer.resblocks[0].mlp.c_fc.bias.detach().cpu().numpy()
     eq_fc1_weight = np.array(eq_model.blocks[0].mlp.fc1.weight)
     eq_fc1_bias = np.array(eq_model.blocks[0].mlp.fc1.bias)
 
     # Weights should be exactly identical
-    assert np.allclose(
-        pt_fc1_weight, eq_fc1_weight, atol=0, rtol=0
-    ), "fc1 weights don't match"
-    assert np.allclose(
-        pt_fc1_bias, eq_fc1_bias, atol=0, rtol=0
-    ), "fc1 bias doesn't match"
+    assert np.allclose(pt_fc1_weight, eq_fc1_weight, atol=0, rtol=0), "fc1 weights don't match"
+    assert np.allclose(pt_fc1_bias, eq_fc1_bias, atol=0, rtol=0), "fc1 bias doesn't match"
 
 
 def test_linear_layer_equivalence(pt_model_and_preprocess, ensure_weights):
@@ -137,9 +119,7 @@ def test_linear_layer_equivalence(pt_model_and_preprocess, ensure_weights):
 
     # Test PyTorch
     with torch.no_grad():
-        pt_output = (
-            pt_visual.transformer.resblocks[0].mlp.c_fc(test_input_pt).cpu().numpy()
-        )
+        pt_output = pt_visual.transformer.resblocks[0].mlp.c_fc(test_input_pt).cpu().numpy()
 
     # Test Equinox
     eq_output = np.array(jax.vmap(eq_model.blocks[0].mlp.fc1)(test_input_jax))
@@ -219,9 +199,7 @@ def test_attention_mechanism(pt_model_and_preprocess, ensure_weights):
     with torch.no_grad():
         x_pt = pt_visual.conv1(img_pt)
         x_pt = x_pt.reshape(x_pt.shape[0], x_pt.shape[1], -1).permute(0, 2, 1)
-        x_pt = torch.cat(
-            [pt_visual.class_embedding.to(x_pt.dtype)[None, None, :], x_pt], dim=1
-        )
+        x_pt = torch.cat([pt_visual.class_embedding.to(x_pt.dtype)[None, None, :], x_pt], dim=1)
         x_pt = x_pt + pt_visual.positional_embedding.to(x_pt.dtype)[None, :, :]
         x_pt = pt_visual.ln_pre(x_pt)[0]  # (50, 768)
         x_pt_ln1 = pt_visual.transformer.resblocks[0].ln_1(x_pt)
@@ -243,7 +221,9 @@ def test_attention_mechanism(pt_model_and_preprocess, ensure_weights):
                 x_pt_ln1[None, :, :],
                 x_pt_ln1[None, :, :],
                 need_weights=False,
-            )[0][0]
+            )[
+                0
+            ][0]
             .cpu()
             .numpy()
         )
@@ -300,9 +280,7 @@ def test_full_transformer_block(pt_model_and_preprocess, ensure_weights):
     with torch.no_grad():
         x_pt = pt_visual.conv1(img_pt)
         x_pt = x_pt.reshape(x_pt.shape[0], x_pt.shape[1], -1).permute(0, 2, 1)
-        x_pt = torch.cat(
-            [pt_visual.class_embedding.to(x_pt.dtype)[None, None, :], x_pt], dim=1
-        )
+        x_pt = torch.cat([pt_visual.class_embedding.to(x_pt.dtype)[None, None, :], x_pt], dim=1)
         x_pt = x_pt + pt_visual.positional_embedding.to(x_pt.dtype)[None, :, :]
         x_pt = pt_visual.ln_pre(x_pt)[0]
 
@@ -315,9 +293,7 @@ def test_full_transformer_block(pt_model_and_preprocess, ensure_weights):
 
     # Run through first block
     with torch.no_grad():
-        pt_block_out = (
-            pt_visual.transformer.resblocks[0](x_pt[None, :, :])[0].cpu().numpy()
-        )
+        pt_block_out = pt_visual.transformer.resblocks[0](x_pt[None, :, :])[0].cpu().numpy()
 
     eq_block_out = np.array(eq_model.blocks[0](x_eq))
 

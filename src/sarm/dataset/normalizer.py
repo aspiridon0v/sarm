@@ -8,9 +8,7 @@ import torch.nn as nn
 import zarr
 
 
-def dict_apply(
-    x: Dict[str, torch.Tensor], func: Callable[[torch.Tensor], torch.Tensor]
-) -> Dict[str, torch.Tensor]:
+def dict_apply(x: Dict[str, torch.Tensor], func: Callable[[torch.Tensor], torch.Tensor]) -> Dict[str, torch.Tensor]:
     result = dict()
     for key, value in x.items():
         if isinstance(value, dict):
@@ -219,9 +217,7 @@ def _fit(
         {
             "scale": scale,
             "offset": offset,
-            "input_stats": nn.ParameterDict(
-                {"min": input_min, "max": input_max, "mean": input_mean, "std": input_std}
-            ),
+            "input_stats": nn.ParameterDict({"min": input_min, "max": input_max, "mean": input_mean, "std": input_std}),
         }
     )
     for p in this_params.parameters():
@@ -279,16 +275,10 @@ def get_normalizer_from_calculated(path, device) -> "SingleFieldLinearNormalizer
     if abs_path is None:
         tried = [
             f"- Hydra to_absolute_path('{original}')",
-            (
-                f"- Absolute '{original}'"
-                if Path(original).is_absolute()
-                else f"- '{Path.cwd() / original}' (CWD)"
-            ),
+            (f"- Absolute '{original}'" if Path(original).is_absolute() else f"- '{Path.cwd() / original}' (CWD)"),
             "- __file__/.. variations",
         ]
-        raise FileNotFoundError(
-            f"Could not locate normalizer JSON '{original}'. Tried:\n" + "\n".join(tried)
-        )
+        raise FileNotFoundError(f"Could not locate normalizer JSON '{original}'. Tried:\n" + "\n".join(tried))
 
     # --- Load and build normalizer ---
     with open(abs_path, "r") as f:

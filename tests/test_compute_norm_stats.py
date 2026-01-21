@@ -26,12 +26,7 @@ def test_compute_norm_stats_integration():
         # Use a small test dataset or the actual dataset
         repo_id = "ETHRC/towel_base_with_rewards"
 
-        compute_norm_stats(
-            repo_id=repo_id,
-            output_path=str(output_path),
-            mode="gaussian",
-            max_frames=100
-        )
+        compute_norm_stats(repo_id=repo_id, output_path=str(output_path), mode="gaussian", max_frames=100)
 
         # Verify the file was created
         assert output_path.exists()

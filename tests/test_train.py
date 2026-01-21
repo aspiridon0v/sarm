@@ -45,14 +45,10 @@ class DummyDataset(Dataset):
         images = np.random.randn(self.num_cameras, self.timesteps, 3, 224, 224) * 0.1
         state = np.random.randn(self.timesteps, 14) * 0.1
         progress = np.linspace(0, 1, self.timesteps)
-        text_tokens = np.stack(
-            [self.tokenizer("dummy text for testing").squeeze(0) for t in range(self.timesteps)]
-        )
+        text_tokens = np.stack([self.tokenizer("dummy text for testing").squeeze(0) for t in range(self.timesteps)])
         if self.padding:
             length = (
-                self.timesteps - self.padding
-                if self.padding > 0 and self.padding < self.timesteps
-                else self.timesteps
+                self.timesteps - self.padding if self.padding > 0 and self.padding < self.timesteps else self.timesteps
             )
         else:
             length = self.timesteps
@@ -159,7 +155,7 @@ def test_process_transformer_step(sarm_modules, dummy_batch):
         progress_targets,
         optimizer,
         opt_state,
-        key
+        key,
     )
 
     # Assertions
@@ -366,9 +362,7 @@ def test_stage_transformer_overfitting(sarm_modules):
         accuracies.append(float(accuracy))
 
     # Check that loss decreased
-    assert (
-        losses[-1] < losses[0]
-    ), f"Loss should decrease. Initial: {losses[0]:.4f}, Final: {losses[-1]:.4f}"
+    assert losses[-1] < losses[0], f"Loss should decrease. Initial: {losses[0]:.4f}, Final: {losses[-1]:.4f}"
     assert all(jnp.isfinite(l) for l in losses), "All losses should be finite"
 
     # For overfitting on 2 identical samples, we expect high accuracy eventually

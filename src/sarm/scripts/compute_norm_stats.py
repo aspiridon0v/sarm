@@ -37,7 +37,7 @@ def compute_norm_stats(
     mode: str = "gaussian",
     state_dim: int | None = None,
     action_dim: int | None = None,
-    max_frames: int | None = None
+    max_frames: int | None = None,
 ):
     """
     Compute normalization statistics for a LeRobot dataset.
@@ -62,7 +62,7 @@ def compute_norm_stats(
     if max_frames is not None and max_frames < N:
         N = max_frames
         print(f"Using {N} frames for calculations")
-    
+
     print(f"Features: {list(dataset.hf_dataset.features.keys())}")
 
     # Collect state and action data
@@ -178,9 +178,7 @@ def compute_norm_stats(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Compute normalization statistics for a LeRobot dataset"
-    )
+    parser = argparse.ArgumentParser(description="Compute normalization statistics for a LeRobot dataset")
     parser.add_argument(
         "--repo_id",
         type=str,

@@ -18,19 +18,21 @@ def get_valid_episodes(repo_id: str, root: str | Path | None = None) -> List[int
         List[int]: Sorted list of valid episode indices (e.g., [0, 1, 5, 7, ...])
     """
     dataset = LeRobotDataset(repo_id=repo_id, root=root)
-    rewards = dataset.hf_dataset['next.reward']
+    rewards = dataset.hf_dataset["next.reward"]
     NUM_SUBTASKS = np.ceil(np.max(rewards))
-    episodes = list(dataset.meta.episodes['episode_index'])
-    
+    episodes = list(dataset.meta.episodes["episode_index"])
+
     non_valid_episodes = []
     for ep_idx in episodes:
         ep = dataset.meta.episodes[ep_idx]
         ep_end = ep["dataset_to_index"]
-        if np.ceil(rewards[ep_end-1]) != NUM_SUBTASKS:
+        if np.ceil(rewards[ep_end - 1]) != NUM_SUBTASKS:
             non_valid_episodes.append(ep_idx)
-    
+
     if len(non_valid_episodes) > 0:
-        logging.warn(f'Total Episodes {len(episodes)}. INVALID EPISODES found. Episodes with missing subtasks {non_valid_episodes}')
+        logging.warn(
+            f"Total Episodes {len(episodes)}. INVALID EPISODES found. Episodes with missing subtasks {non_valid_episodes}"
+        )
     valid_episodes = [e for e in episodes if e not in non_valid_episodes]
     return sorted(valid_episodes)
 
