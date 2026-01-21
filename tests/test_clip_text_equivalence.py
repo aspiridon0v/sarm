@@ -11,7 +11,6 @@ import torch
 from sarm.model.clip import CLIP, TextTransformer, load_clip_npz, load_text_npz
 from sarm.utils.convert_clip import main as export_clip_weights
 
-WEIGHTS_PATH = "checkpoints/clip_vit_b32_openai.npz"
 
 
 @pytest.fixture(scope="session")
@@ -24,15 +23,6 @@ def pt_model_and_tokenizer(torch_device):
     model.to(torch_device)
     tokenizer = open_clip.get_tokenizer("ViT-B-32")
     return model, tokenizer, preprocess, torch_device
-
-
-@pytest.fixture(scope="session")
-def ensure_weights(pt_model_and_tokenizer):
-    """Export weights once per session if not already present."""
-    if not os.path.exists(WEIGHTS_PATH):
-        export_clip_weights()
-    assert os.path.exists(WEIGHTS_PATH), "Failed to export CLIP weights to .npz"
-    return WEIGHTS_PATH
 
 
 def _make_test_texts():

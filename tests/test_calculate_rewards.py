@@ -1,6 +1,5 @@
 import math
 import torch
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata, LeRobotDataset
 
 from sarm.dataset.gap_dataset import GapLerobotDataset
 from sarm.model.reward_sarm import RewardWeights, RewardSarm
@@ -67,7 +66,7 @@ def test_mocked_reward_model():
         
     sarm_mock = SarmMock()
     reward_model = RewardSarm(sarm=sarm_mock)
-    repo_id = 'ETHRC/piper_towel_v0'
+    repo_id = 'ETHRC/towel_base_with_rewards'
     dataset_gab = GapLerobotDataset(repo_id=repo_id, action_horizon=25, frame_gap=30, t_step_lookback=8)
     batch_size = 4
     data_loader = torch.utils.data.DataLoader(

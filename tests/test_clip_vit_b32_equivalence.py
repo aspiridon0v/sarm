@@ -12,8 +12,6 @@ from PIL import Image, ImageDraw
 from sarm.model.clip import ViTB32, load_vision_npz
 from sarm.utils.convert_clip import main as export_clip_weights
 
-WEIGHTS_PATH = "checkpoints/clip_vit_b32_openai.npz"
-
 
 @pytest.fixture(scope="session")
 def pt_model_and_preprocess(torch_device):
@@ -25,15 +23,6 @@ def pt_model_and_preprocess(torch_device):
     model.eval()
     model.to(torch_device)
     return model, preprocess, torch_device
-
-
-@pytest.fixture(scope="session")
-def ensure_weights(pt_model_and_preprocess):
-    # Export weights once per session if not already present
-    if not os.path.exists(WEIGHTS_PATH):
-        export_clip_weights()
-    assert os.path.exists(WEIGHTS_PATH), "Failed to export CLIP weights to .npz"
-    return WEIGHTS_PATH
 
 
 def _make_test_images():

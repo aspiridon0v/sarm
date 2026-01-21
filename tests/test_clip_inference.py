@@ -15,11 +15,9 @@ import pytest
 import torch
 from PIL import Image, ImageDraw
 
-from sarm.model.clip import CLIP, load_clip_npz
-from sarm.utils.convert_clip import main as export_clip_weights
+from sarm.model.clip import CLIP, load_clip_npz, preprocess_images_batch
 from sarm.utils.tokenizer import load_tokenizer
 
-WEIGHTS_PATH = "checkpoints/clip_vit_b32_openai.npz"
 
 # Check for GPU availability
 HAS_CUDA = torch.cuda.is_available()
@@ -28,14 +26,6 @@ try:
 except RuntimeError:
     HAS_JAX_GPU = False
 
-
-@pytest.fixture(scope="session")
-def ensure_weights():
-    """Export weights once per session if not already present."""
-    if not os.path.exists(WEIGHTS_PATH):
-        export_clip_weights()
-    assert os.path.exists(WEIGHTS_PATH), "Failed to export CLIP weights to .npz"
-    return WEIGHTS_PATH
 
 
 @pytest.fixture(scope="module")
@@ -510,6 +500,20 @@ def test_sarm_jit_gpu_vs_openclip_gpu_equivalence(sarm_model, openclip_model, te
         f"  Similarities - max diff: {similarity_max_diff:.3e}, mean diff: {similarity_mean_diff:.3e}"
     )
 
+def test_process_batch_image(test_image_and_texts):
+    img_1 = Image.new("RGB", (224, 224), (128, 128, 128))
+    img_2 = Image.new("RGB", (224, 224), (28, 28, 28))
+    arr_1 = preprocess_image_sarm(img_1)
+    arr_2 = preprocess_image_sarm(img_2)
+    arr_want = np.stack([arr_1, arr_2], axis=0)
+    assert arr_want.shape == (2, 3 , 224, 224)
+
+    # (..., C, H, W) in [0,1]
+    img_batch = (np.stack([np.array(img_1), np.array(img_2)], axis=0)
+                 .transpose((0,3,1,2))
+                 .astype(np.float32) / 255.0)
+    arr_got = preprocess_images_batch(img_batch)
+    np.testing.assert_array_almost_equal(arr_want, arr_got)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

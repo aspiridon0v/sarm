@@ -6,7 +6,7 @@ from sarm.dataset.gap_dataset import GapLerobotDataset
 
 
 def test_gap_dataset():
-    repo_id = 'ETHRC/piper_towel_v0'
+    repo_id = 'ETHRC/towel_base_with_rewards'
     
     dataset_meta = LeRobotDatasetMetadata(repo_id)
     action_horizon = 25
