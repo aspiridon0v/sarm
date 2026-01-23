@@ -230,8 +230,12 @@ def _fit(
 
 def _normalize(x, params, forward=True):
     assert "scale" in params
-    if isinstance(x, np.ndarray):
+    if isinstance(x, torch.Tensor):
+        pass
+    elif isinstance(x, np.ndarray):
         x = torch.from_numpy(x)
+    else: #Jax case
+        x = torch.from_numpy(np.asarray(x))
     scale = params["scale"]
     offset = params["offset"]
     x = x.to(device=scale.device, dtype=scale.dtype)
