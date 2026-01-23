@@ -7,7 +7,7 @@ class GeneralConfig:
     project_name: str = "ethrc_sarm"
     task_name: str = "Fold Towel"
     repo_id_sparse: str = "ETHRC/towel_base_with_rewards"
-    state_norm_path: str | Path = "data/ethrc_data_v0.json"
+    state_norm_path: str | Path = "data/towel_base_with_rewards.json"
     camera_names: list[str] = field(
         default_factory=lambda: [
             "observation.images.left_wrist",
@@ -31,6 +31,7 @@ class ModelConfig:
     frame_gap: int = 30
     state_dim: int = 14
     clip_weights_path: str = "checkpoints/clip_vit_b32_openai.npz"
+    clip_preprocess_chunk_size: int = 32  # Images to process at once during resize (lower = less memory)
     model_path: str | Path | None = None
     num_classes_sparse: int = 5
     sparse_annotation_list: list[str] = field(
@@ -43,8 +44,8 @@ class ModelConfig:
         ]
     )
     resume_from_checkpoint: bool = False
-    progress_checkpoint_path: str | None = "checkpoints/prg_t-2025.11.04-22.33.21_s-50-b2.eqx"
-    stage_checkpoint_path: str | None = "checkpoints/stg_t-2025.11.04-22.33.21_s-50-b2.eqx"
+    progress_checkpoint_path: str | None = "checkpoints/prg_t-2026.01.23-02.41.26-s-5000-b48.eqx"
+    stage_checkpoint_path: str | None = "checkpoints/stg_t-2026.01.23-02.41.26-s-5000-b48.eqx"
 
 
 @dataclass
@@ -60,17 +61,18 @@ class OptimizerConfig:
 @dataclass
 class TrainConfig:
     num_epochs: int = 2
-    grad_clip: float = 2.0
-    log_every: int = 1  # in steps
-    eval_every: int = 1  # in epochs
+    grad_clip: float = 1.0
+    log_every: int = 5  # in steps
+    eval_every: int = 20  # in steps
     save_every: int = 1000
     val_portion: float = 0.1  # portion of the dataset to use for validation
+    dense_shema: bool = False
 
 
 @dataclass
 class TrainLoaderConfig:
     batch_size: int = 32
-    num_workers: int = 1
+    num_workers: int = 4
     shuffle: bool = True
     pin_memory: bool = False
     persistant_workers: bool = False

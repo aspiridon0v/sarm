@@ -1,9 +1,14 @@
 import math
+
+import pytest
 import torch
 
+from sarm.config.sarm_config import SarmConfig
 from sarm.dataset.gap_dataset import GapLerobotDataset
 from sarm.model.reward_sarm import RewardWeights, RewardSarm
 import jax.numpy as jnp
+
+from sarm.model.sarm import Sarm
 
 
 def test_rewar_weights():
@@ -58,18 +63,23 @@ def test_get_weights():
     assert all(weights >= 0) and all(weights <= 1)
 
 
-def test_mocked_reward_model():
-    class SarmMock:
-        def __init__(self):
-            self.n = 0
+class SarmMock:
+    def __init__(self):
+        self.n = 0
 
-        def __call__(self, batch):
-            self.n += 1
-            shape = batch["observation.state"].shape
-            return jnp.ones((shape[0], shape[1])) * self.n
+    def __call__(self, batch):
+        self.n += 1
+        shape = batch["observation.state"].shape
+        return jnp.ones((shape[0], shape[1])) * self.n
 
-    sarm_mock = SarmMock()
-    reward_model = RewardSarm(sarm=sarm_mock)
+@pytest.mark.parametrize('mock', [True, False])
+def test_mocked_reward_model(mock):
+    if mock:
+        sarm_model = SarmMock()
+    else:
+        config = SarmConfig()
+        sarm_model = Sarm.init_sarm_from_config(config=config, key=None)
+    reward_model = RewardSarm(sarm=sarm_model)
     repo_id = "ETHRC/towel_base_with_rewards"
     dataset_gab = GapLerobotDataset(repo_id=repo_id, action_horizon=25, frame_gap=30, t_step_lookback=8)
     batch_size = 4
@@ -82,3 +92,4 @@ def test_mocked_reward_model():
     weights = reward_model(batch)
     assert len(weights) == batch_size
     assert math.isclose(weights.sum(), 1, abs_tol=1e-5)
+

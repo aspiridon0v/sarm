@@ -17,7 +17,7 @@ def get_valid_episodes(repo_id: str, root: str | Path | None = None) -> List[int
     Returns:
         List[int]: Sorted list of valid episode indices (e.g., [0, 1, 5, 7, ...])
     """
-    dataset = LeRobotDataset(repo_id=repo_id, root=root)
+    dataset = LeRobotDataset(repo_id=repo_id, root=root, download_videos=False,)
     rewards = dataset.hf_dataset["next.reward"]
     NUM_SUBTASKS = np.ceil(np.max(rewards))
     episodes = list(dataset.meta.episodes["episode_index"])

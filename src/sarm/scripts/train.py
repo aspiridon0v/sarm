@@ -20,25 +20,13 @@ import wandb
 from sarm.config.sarm_config import SarmConfig
 from sarm.dataset.data_utils import get_valid_episodes, split_train_eval_episodes
 from sarm.dataset.dataset import SarmDataset
-from sarm.dataset.normalizer import get_normalizer_from_calculated
 from sarm.model.clip import preprocess_images_batch
 from sarm.model.sarm import ProgressTransformer, StageTransformer, Sarm
 from sarm.utils.logger_setup import setup_logger
-from sarm.utils.tokenizer import load_tokenizer
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-
-class TrainContext:
-    """Holds preprocessing dependencies and config for training."""
-
-    def __init__(self, config: SarmConfig, tokenizer, state_normalizer, dense_schema: bool = False):
-        self.config = config
-        self.tokenizer = tokenizer
-        self.state_normalizer = state_normalizer
-        self.dense_schema = dense_schema
 
 
 @dataclass
@@ -187,24 +175,22 @@ def step_stage_transformer(
     return stage_transformer, opt_state, loss, grads, logits
 
 
-def preprocess_batch(batch, tokenizer, state_normalizer, config: SarmConfig, dense_schema: bool = False):
-    B, T = batch[config.general_config.camera_names[0]].shape[:2]
+def preprocess_batch(batch, sarm_model: Sarm, config: SarmConfig, dense_schema: bool = False):
+    B, T = batch[sarm_model.camera_names[0]].shape[:2]
 
     # Image Preprocessing
-    imgs_list = []
-    for key in config.general_config.camera_names:
-        imgs_list.append(batch[key])
+    imgs_list = [batch[cam] for cam in sarm_model.camera_names]
     imgs = np.stack(imgs_list, axis=0)  # N, B, T, C, H, W
     imgs_preprocessed = preprocess_images_batch(imgs, chunk_size=config.model_config.clip_preprocess_chunk_size)
     imgs_preprocessed = einops.rearrange(imgs_preprocessed, "n b t c h w -> b n t c h w")
 
     # Text Preprocessing
     text_str = batch["task"]  # B
-    text_tokens = einops.repeat(jnp.array(tokenizer(text_str)), "b s -> b t s", t=T)
+    text_tokens = einops.repeat(jnp.array(sarm_model.tokenizer(text_str)), "b s -> b t s", t=T)
 
     # State Preprocessing
     states = batch["observation.state"]  # B T D
-    states = jnp.array(state_normalizer.normalize(states).detach().numpy())
+    states = jnp.array(sarm_model.state_normalizer.normalize(states).detach().numpy())
 
     lengths = jnp.array(batch["lengths"])
     progress = jnp.array(batch["targets"])
@@ -221,13 +207,12 @@ def preprocess_batch(batch, tokenizer, state_normalizer, config: SarmConfig, den
     }
 
 
-def prepare_batch(batch: dict, sarm_model: Sarm, ctx: TrainContext) -> PreparedBatch:
+def prepare_batch(batch: dict, sarm_model: Sarm, config: SarmConfig) -> PreparedBatch:
     preprocessed = preprocess_batch(
         batch=batch,
-        tokenizer=ctx.tokenizer,
-        state_normalizer=ctx.state_normalizer,
-        config=ctx.config,
-        dense_schema=ctx.dense_schema,
+        sarm_model=sarm_model,
+        config=config,
+        dense_schema=config.train_config.dense_shema,
     )
 
     gt_stage = jnp.floor(preprocessed["progress"]).astype(jnp.int32)
@@ -236,7 +221,7 @@ def prepare_batch(batch: dict, sarm_model: Sarm, ctx: TrainContext) -> PreparedB
     img_features, text_features = sarm_model.clip_inference(
         preprocessed["imgs_preprocessed"],
         preprocessed["text_tokens"],
-        img_chunk_size=ctx.config.model_config.clip_preprocess_chunk_size,
+        img_chunk_size=config.model_config.clip_preprocess_chunk_size,
     )
 
     return PreparedBatch(
@@ -413,12 +398,12 @@ def init_opt_state(
     )
 
 
-def eval_step(batch: dict, sarm_model: Sarm, ctx: TrainContext):
+def eval_step(batch: dict, sarm_model: Sarm, config: SarmConfig):
     """Evaluation step - no gradients, inference mode."""
     # Put entire model in inference mode (handles dropout, etc.)
     sarm_model_eval = eqx.nn.inference_mode(sarm_model)
 
-    prepared = prepare_batch(batch=batch, sarm_model=sarm_model_eval, ctx=ctx)
+    prepared = prepare_batch(batch=batch, sarm_model=sarm_model_eval, config=config)
 
     # Stage prediction (inference mode)
     logits = sarm_model_eval.predict_stage(
@@ -477,12 +462,12 @@ def train_step(
     batch: dict,
     sarm_model: Sarm,
     opt_state: OptState,
-    ctx: TrainContext,
+    config: SarmConfig,
     train_key: PRNGKeyArray,
 ):
     train_key, stage_key, prog_key = jr.split(train_key, 3)
 
-    batch_pre = prepare_batch(batch=batch, sarm_model=sarm_model, ctx=ctx)
+    batch_pre = prepare_batch(batch=batch, sarm_model=sarm_model, config=config)
 
     # Stage transformer training step
     stage_transformer, stage_opt_state, stage_loss, stage_grads, logits = step_stage_transformer(
@@ -502,7 +487,7 @@ def train_step(
     if torch.rand(1).item() < 0.75:
         stage_emb = jax.nn.one_hot(
             batch_pre.gt_stage,
-            num_classes=len(ctx.config.model_config.sparse_annotation_list),
+            num_classes=len(config.model_config.sparse_annotation_list),
         )
     else:
         stage_emb = jax.nn.one_hot(jnp.argmax(logits, axis=-1), num_classes=logits.shape[-1], axis=-1)
@@ -565,6 +550,9 @@ def get_next_batch(data_iter, data_loader):
 
 
 def train(config: SarmConfig):
+    if config.train_config.dense_shema:
+        raise NotImplementedError("Dense schema training is not implemented yet")
+
     setup_logger(config, logger)
     init_wandb(config)
     train_episodes_sparse, eval_episodes_sparse = load_dataset_sparse(config)
@@ -577,23 +565,10 @@ def train(config: SarmConfig):
     eval_iter = iter(val_loader)
     logger.info("Initialized data loader")
 
-    state_normalizer = get_normalizer_from_calculated(config.general_config.state_norm_path, "cpu")
-    logger.info(f"Loaded state normalizer from {config.general_config.state_norm_path}")
-
-    tokenizer = load_tokenizer()
-    logger.info("Loaded tokenizer")
-
-    ctx = TrainContext(
-        config=config,
-        tokenizer=tokenizer,
-        state_normalizer=state_normalizer,
-        dense_schema=False,  # TODO: make configurable
-    )
-
-    logger.info("Initializing models...")
     model_key, train_key = jr.split(jr.PRNGKey(config.general_config.seed), 2)
 
     sarm_model = Sarm.init_sarm_from_config(config=config, key=model_key)
+    logger.info("Initialized models")
 
     if config.model_config.resume_from_checkpoint:
         sarm_model.load_checkpoint(
@@ -618,7 +593,7 @@ def train(config: SarmConfig):
             batch=batch,
             sarm_model=sarm_model,
             opt_state=opt_state,
-            ctx=ctx,
+            config=config,
             train_key=train_key,
         )
         pbar.set_postfix({"total_loss": f"{info['train/total_loss']:.4f}", "lr": f"{info['train/lr']:.2e}"})
@@ -633,7 +608,7 @@ def train(config: SarmConfig):
 
             for _ in range(num_eval_batches):
                 eval_batch = get_next_batch(eval_iter, val_loader)
-                metrics = eval_step(batch=eval_batch, sarm_model=sarm_model, ctx=ctx)
+                metrics = eval_step(batch=eval_batch, sarm_model=sarm_model, config=config)
                 eval_metrics_list.append(metrics)
             log_eval_metrics(eval_metrics_list=eval_metrics_list, step=opt_state.step)
 

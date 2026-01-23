@@ -11,6 +11,7 @@ class GapLerobotDataset(LeRobotDataset):
         t_step_lookback: int,
         frame_gap: int,
         root: str | Path | None = None,
+        episodes: list[int] | None = None,
         action_keys=("action",),
     ):
         dataset_meta = LeRobotDatasetMetadata(repo_id, root)
@@ -18,7 +19,7 @@ class GapLerobotDataset(LeRobotDataset):
         self.action_horizon = action_horizon
         self.t_step_lookback = t_step_lookback
         self.frame_gap = frame_gap
-        super().__init__(repo_id=repo_id, root=root, delta_timestamps=delta_timestamps)
+        super().__init__(repo_id=repo_id, root=root, delta_timestamps=delta_timestamps, episodes=episodes)
 
     # Source: Taken from SARM paper supplementary materials
     def get_frame_indices(
@@ -82,10 +83,25 @@ class GapLerobotDataset(LeRobotDataset):
             ep_start=ep_start,
             ep_end=ep_end,
         )
-        item_hist = self.hf_dataset.select(obs_indices)
+
+        # Convert absolute indices to relative indices for filtered dataset
+        if self._absolute_to_relative_idx is not None:
+            relative_obs_indices = [self._absolute_to_relative_idx[i] for i in obs_indices]
+        else:
+            relative_obs_indices = obs_indices
+
+        item_hist = self.hf_dataset.select(relative_obs_indices)
         dict_hist = {k: torch.stack(list(item_hist[k])) for k in item_hist.features}
 
+        task_index = torch.tensor(item_hist['task_index'])
+        assert torch.all(task_index == task_index[0]), 'task should be the same for each index in the episode'
+        task_str = self.meta.tasks.index[item_hist['task_index']].values[0]
+        dict_hist['task_index'] = task_str  # keep for backward compat
+        dict_hist['task'] = task_str        # alias for Sarm compatibility
+        dict_hist['lengths'] = self.t_step_lookback + 1  # sequence length for Sarm
+
         if len(self.meta.video_keys) > 0:
+            # query_indices uses absolute indices as _get_query_timestamps handles conversion
             query_indices = {key: obs_indices for key in self.meta.video_keys}
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
@@ -101,7 +117,10 @@ class GapLerobotDataset(LeRobotDataset):
 
         dict_hist_0 = self._get_hist_data(idx=idx, current_ts=ts_0, ep_idx=ep_idx)
         dict_hist_1 = self._get_hist_data(idx=idx_1, current_ts=ts_1, ep_idx=ep_idx)
+
+
         for k in dict_hist_0:
             item[f"gap_data_0.{k}"] = dict_hist_0[k]
             item[f"gap_data_1.{k}"] = dict_hist_1[k]
         return item
+

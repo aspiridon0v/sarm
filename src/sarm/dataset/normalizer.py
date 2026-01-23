@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import zarr
+import jax
+from jax import numpy as jnp
+from jaxtyping import ArrayLike
 
 
 def dict_apply(x: Dict[str, torch.Tensor], func: Callable[[torch.Tensor], torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -302,3 +305,20 @@ def get_normalizer_from_calculated(path, device) -> "SingleFieldLinearNormalizer
         },
     )
     return state_normalizer
+
+
+def _load_normalized_sarm_reward(path):
+    with open(path, "r") as f:
+        norm_data = json.load(f)
+    reward = norm_data['sarm_rewards']
+    reward = jnp.array(sorted([float(v) for v in reward.values()]))
+    return reward
+
+@jax.jit
+def normalize_reward(value: ArrayLike, cum_rewards: jnp.ndarray) -> jnp.ndarray:
+    MAX = len(cum_rewards)
+    value = jnp.asarray(value)
+    v = jnp.floor(value).astype(jnp.int32)
+    stage_0 = jnp.where(v > 0, cum_rewards[v - 1], 0.0)
+    stage_1 = jnp.where(v < MAX, cum_rewards[v], 1)
+    return stage_0 + (stage_1 - stage_0) * (value - v.astype(jnp.float32))

@@ -1,3 +1,4 @@
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 
@@ -39,7 +40,7 @@ class RewardWeights:
 
 class RewardSarm:
     def __init__(self, sarm, epsilon=1e-6, kappa=0.01):
-        self.sarm = sarm
+        self.sarm = eqx.nn.inference_mode(sarm)
         self.epsilon = epsilon
         self.rw = RewardWeights(epsilon=epsilon, kappa=kappa)
 

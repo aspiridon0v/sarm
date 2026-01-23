@@ -1,3 +1,5 @@
+import os
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -12,7 +14,6 @@ from sarm.model.clip import CLIP
 from sarm.model.sarm import ProgressTransformer, StageTransformer, Sarm, clip_inference
 from sarm.config.sarm_config import SarmConfig
 from sarm.scripts.train import (
-    TrainContext,
     eval_step,
     step_progress_transformer,
     step_stage_transformer,
@@ -369,20 +370,22 @@ def test_stage_transformer_overfitting(sarm_modules):
     assert accuracies[-1] >= 0.5, f"Accuracy should improve. Final accuracy: {accuracies[-1]:.2f}"
 
 
-def test_eval_step(sarm_modules):
+def test_eval_sarm_step(sarm_modules):
+    config = SarmConfig()
+
     """Ensure eval_step runs without providing a PRNG key."""
     process_transformer, stage_transformer, clip_model = sarm_modules
     sarm_model = Sarm(
         progress_transformer=process_transformer,
         stage_transformer=stage_transformer,
         clip_model=clip_model,
+        tokenizer = load_tokenizer(),
+        state_normalizer = DummyStateNormalizer(),
+        camera_names=[config.general_config.camera_names[0]]
     )
 
-    config = SarmConfig()
     config.model_config.clip_preprocess_chunk_size = 4
-    tokenizer = load_tokenizer()
-    state_normalizer = DummyStateNormalizer()
-    ctx = TrainContext(config=config, tokenizer=tokenizer, state_normalizer=state_normalizer, dense_schema=True)
+
 
     B, T = 2, 4
     images = np.random.randn(B, T, 3, 32, 32).astype(np.float32)
@@ -394,7 +397,61 @@ def test_eval_step(sarm_modules):
         "targets": np.tile(np.linspace(0.0, 1.0, T, dtype=np.float32), (B, 1)),
     }
 
-    metrics = eval_step(batch=batch, sarm_model=sarm_model, ctx=ctx)
+    metrics = eval_step(batch=batch, sarm_model=sarm_model, config=config)
 
     assert "total_loss" in metrics
     assert np.isfinite(metrics["total_loss"])
+
+
+def test_save_sarm_model(tmp_path, monkeypatch):
+    """Test save and load roundtrip for Sarm model using consistent config parameters."""
+    cwd = os.getcwd()
+    monkeypatch.chdir(tmp_path)
+    save_dir = tmp_path / 'checkpoints'
+    config = SarmConfig()
+
+    # Create models using config parameters for consistency
+    key = jr.PRNGKey(42)
+    progress_key, stage_key, clip_key = jr.split(key, 3)
+
+    progress_transformer = ProgressTransformer(
+        d_model=config.model_config.d_model,
+        nheads=config.model_config.n_heads,
+        layers=config.model_config.n_layers,
+        num_cameras=len(config.general_config.camera_names),
+        state_dim=config.model_config.state_dim,
+        key=progress_key,
+    )
+    stage_transformer = StageTransformer(
+        d_model=config.model_config.d_model,
+        nheads=config.model_config.n_heads,
+        layers=config.model_config.n_layers,
+        num_cameras=len(config.general_config.camera_names),
+        state_dim=config.model_config.state_dim,
+        num_classes_sparse=len(config.model_config.sparse_annotation_list),
+        key=stage_key,
+    )
+    clip_model = CLIP(key=clip_key)
+
+    sarm_model = Sarm(
+        progress_transformer=progress_transformer,
+        stage_transformer=stage_transformer,
+        clip_model=clip_model,
+        tokenizer=load_tokenizer(),
+        state_normalizer=DummyStateNormalizer(),
+        camera_names=config.general_config.camera_names,
+    )
+
+    sarm_model.save_model(config, step=0)
+    saved_files = list(save_dir.iterdir())
+    assert len(saved_files) == 2
+
+    config.model_config.progress_checkpoint_path = str([f for f in saved_files if 'prg_t' in f.parts[-1]][0])
+    config.model_config.stage_checkpoint_path = str([f for f in saved_files if 'stg_t' in f.parts[-1]][0])
+    monkeypatch.chdir(cwd)
+
+    sarm_model_loaded = Sarm.load_sarm_checkpoint_from_config(config)
+
+    # Verify the loaded model has the same structure
+    assert sarm_model_loaded.progress_transformer.positional_embedding.shape == progress_transformer.positional_embedding.shape
+    assert sarm_model_loaded.stage_transformer.positional_embedding.shape == stage_transformer.positional_embedding.shape

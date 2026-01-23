@@ -1,5 +1,6 @@
-import datetime
+from datetime import datetime
 import logging
+from pathlib import Path
 from typing import Callable
 
 import einops
@@ -7,9 +8,17 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jaxtyping import PyTree, PRNGKeyArray, Array
 
-from sarm.model.clip import CLIP, Block, load_clip_npz
+from sarm.dataset.normalizer import (
+    SingleFieldLinearNormalizer,
+    get_normalizer_from_calculated,
+    _load_normalized_sarm_reward,
+    normalize_reward,
+)
+from sarm.model.clip import CLIP, Block, load_clip_npz, preprocess_images_batch
+from sarm.utils.tokenizer import ClipTokenizer, load_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -358,16 +367,28 @@ class Sarm(eqx.Module):
     progress_transformer: ProgressTransformer
     stage_transformer: StageTransformer
     clip_model: CLIP
+    tokenizer: ClipTokenizer = eqx.field(static=True)
+    state_normalizer: SingleFieldLinearNormalizer = eqx.field(static=True)
+    camera_names: tuple[str, ...] = eqx.field(static=True)
+    norm_sarm_rewards: jnp.ndarray | None = eqx.field(static=True, default=None)
 
     def __init__(
         self,
         progress_transformer: ProgressTransformer,
         stage_transformer: StageTransformer,
         clip_model: CLIP,
+        tokenizer: ClipTokenizer,
+        state_normalizer: SingleFieldLinearNormalizer,
+        camera_names: tuple[str, ...],
+        norm_sarm_rewards: jnp.ndarray | None = None,
     ):
         self.progress_transformer = progress_transformer
         self.stage_transformer = stage_transformer
         self.clip_model = clip_model
+        self.tokenizer = tokenizer
+        self.state_normalizer = state_normalizer
+        self.camera_names = camera_names
+        self.norm_sarm_rewards = norm_sarm_rewards
 
     def clip_inference(
         self,
@@ -378,6 +399,13 @@ class Sarm(eqx.Module):
     ) -> tuple[jax.Array, jax.Array]:
         return clip_inference(self.clip_model, images, text_tokens, img_chunk_size, text_chunk_size)
 
+    @eqx.filter_jit
+    def normalize_rewards(self, rewards: jax.Array) -> jax.Array:
+        if self.norm_sarm_rewards is None:
+            return rewards
+        return normalize_reward(rewards, self.norm_sarm_rewards)
+
+    @eqx.filter_jit
     def predict_stage(
         self,
         img_features: jax.Array,
@@ -412,6 +440,7 @@ class Sarm(eqx.Module):
             in_axes=(0, 0, 0, 0, None, 0),
         )(img_features, text_features, state, length, dense_schema, keys)
 
+    @eqx.filter_jit
     def predict_progress(
         self,
         img_features: jax.Array,
@@ -450,59 +479,94 @@ class Sarm(eqx.Module):
 
     def __call__(
         self,
-        images: jax.Array,
-        text_tokens: jax.Array,
-        state: jax.Array,
-        length: jax.Array,
-        dense_schema: bool,
-        img_chunk_size: int = 64,
-        key: PRNGKeyArray | None = None,
-    ) -> dict[str, jax.Array]:
-        """Full forward pass: encode features, predict stage, then predict progress.
+        batch,
+        dense_schema: bool = True,
+        img_preprocess_chunk_size: int = 16,
+    ) -> jax.Array:
+        """Run full inference on a batch.
 
         Args:
-            images: Image tensor of shape (B, N, T, C, H, W)
-            text_tokens: Text tokens of shape (B, T, seq_len)
-            state: State features of shape (B, T, d_state)
-            length: Sequence lengths of shape (B,)
+            batch: Dictionary containing:
+                - camera_name keys: Images of shape (B, T, C, H, W)
+                - "task": List of task description strings (B,)
+                - "observation.state": States of shape (B, T, D)
+                - "lengths": Sequence lengths of shape (B,)
             dense_schema: Whether using dense annotation schema
-            img_chunk_size: Batch size for CLIP image encoding
-            key: Optional PRNG key for dropout
+            img_preprocess_chunk_size: Chunk size for image preprocessing (lower = less GPU memory)
 
         Returns:
-            Dictionary with keys:
-                - img_features: (B, N, T, d_vis)
-                - text_features: (B, T, d_text)
-                - stage_logits: (B, T, num_classes)
-                - progress: (B, T)
+            Combined predictions of shape (B, T) as stage + progress
         """
-        stage_key, prog_key = jr.split(key) if key is not None else (None, None)
+        B, T = batch[self.camera_names[0]].shape[:2]
 
-        img_features, text_features = self.clip_inference(images, text_tokens, img_chunk_size=img_chunk_size)
+        # Image preprocessing: stack cameras and preprocess for CLIP
+        imgs_list = [batch[cam] for cam in self.camera_names]
+        imgs = np.stack(imgs_list, axis=0)  # (N, B, T, C, H, W)
+        imgs_preprocessed = preprocess_images_batch(imgs, chunk_size=img_preprocess_chunk_size)
+        imgs_preprocessed = einops.rearrange(imgs_preprocessed, "n b t c h w -> b n t c h w")
 
-        stage_logits = self.predict_stage(img_features, text_features, state, length, dense_schema, stage_key)
+        text_tokens = einops.repeat(jnp.array(self.tokenizer(batch["task"])), "b s -> b t s", t=T)
 
-        # Use predicted stage for progress prediction
-        stage_emb = jax.nn.one_hot(jnp.argmax(stage_logits, axis=-1), num_classes=stage_logits.shape[-1])
+        states = jnp.array(self.state_normalizer.normalize(batch["observation.state"]).detach().numpy())
 
-        progress = self.predict_progress(img_features, text_features, state, stage_emb, length, dense_schema, prog_key)
+        lengths = jnp.array(batch["lengths"])
 
-        return {
-            "img_features": img_features,
-            "text_features": text_features,
-            "stage_logits": stage_logits,
-            "progress": progress,
-        }
+        img_features, text_features = self.clip_inference(imgs_preprocessed, text_tokens)
+
+        # Stage prediction
+        logits = self.predict_stage(
+            img_features=img_features,
+            text_features=text_features,
+            state=states,
+            length=lengths,
+            dense_schema=dense_schema,
+            key=None,
+        )
+
+        stage_emb = jax.nn.one_hot(jnp.argmax(logits, axis=-1), num_classes=logits.shape[-1])
+        progress = self.predict_progress(
+            img_features=img_features,
+            text_features=text_features,
+            state=states,
+            stage_emb=stage_emb,
+            length=lengths,
+            dense_schema=dense_schema,
+            key=None,
+        )
+
+        return jnp.argmax(logits, axis=-1).astype(jnp.float32) + progress
 
     def load_checkpoint(self, progress_checkpoint_path, stage_checkpoint_path):
+        """Load checkpoints and return a new Sarm instance with loaded weights.
+
+        Note: Equinox modules are immutable, so this returns a new instance.
+        """
         assert progress_checkpoint_path is not None, "Progress checkpoint path is required"
         assert stage_checkpoint_path is not None, "Stage checkpoint path is required"
-        self.progress_transformer = self.progress_transformer.load_checkpoint(progress_checkpoint_path)
-        self.stage_transformer = self.stage_transformer.load_checkpoint(stage_checkpoint_path)
+        new_progress = self.progress_transformer.load_checkpoint(progress_checkpoint_path)
+        new_stage = self.stage_transformer.load_checkpoint(stage_checkpoint_path)
         logger.info(f"Loaded checkpoint from {progress_checkpoint_path} and {stage_checkpoint_path}")
+        return eqx.tree_at(
+            lambda m: (m.progress_transformer, m.stage_transformer),
+            self,
+            (new_progress, new_stage)
+        )
+
+    @classmethod
+    def load_sarm_checkpoint_from_config(cls, config, key: Array | None = None):
+        if key is None:
+            key = jr.PRNGKey(0)
+        sarm_model = cls.init_sarm_from_config(config, key)
+        sarm_model = sarm_model.load_checkpoint(
+            stage_checkpoint_path=config.model_config.stage_checkpoint_path,
+            progress_checkpoint_path=config.model_config.progress_checkpoint_path,
+        )
+        return sarm_model
 
     @classmethod
     def init_sarm_from_config(cls, config, key: Array):
+        if key is None:
+            key = jr.PRNGKey(0)
         progress_key, stage_key, clip_key = jr.split(key, 3)
         progress_transformer = ProgressTransformer(
             d_model=config.model_config.d_model,
@@ -513,7 +577,7 @@ class Sarm(eqx.Module):
             dropout=config.model_config.dropout,
             key=progress_key,
         )
-        logger.info(f"Created SARM progress transformer")
+        logger.info("Created SARM progress transformer")
         stage_transformer = StageTransformer(
             d_model=config.model_config.d_model,
             nheads=config.model_config.n_heads,
@@ -524,20 +588,40 @@ class Sarm(eqx.Module):
             dropout=config.model_config.dropout,
             key=stage_key,
         )
-        logger.info(f"Created SARM stage transformer")
+        logger.info("Created SARM stage transformer")
         clip_model = load_clip_npz(CLIP(key=clip_key), config.model_config.clip_weights_path)
         logger.info(f"Loaded CLIP model from {config.model_config.clip_weights_path}")
+
+        tokenizer = load_tokenizer()
+        logger.info("Loaded CLIP tokenizer")
+
+        state_normalizer = get_normalizer_from_calculated(config.general_config.state_norm_path, device="cpu")
+        logger.info(f"Loaded state normalizer from {config.general_config.state_norm_path}")
+
+        try:
+            norm_sarm_rewards = _load_normalized_sarm_reward(config.general_config.state_norm_path)
+        except (FileNotFoundError, KeyError):
+            norm_sarm_rewards = None
+            logger.warning("SARM reward normalization values not found, rewards will not be normalized")
+
         return cls(
             progress_transformer=progress_transformer,
             stage_transformer=stage_transformer,
             clip_model=clip_model,
+            tokenizer=tokenizer,
+            state_normalizer=state_normalizer,
+            camera_names=tuple(config.general_config.camera_names),
+            norm_sarm_rewards=norm_sarm_rewards,
         )
 
     def save_model(self, config, step):
+        save_dir  = Path.cwd() / 'checkpoints'
+        save_dir.mkdir(parents=True, exist_ok=True)
+
         datetime_str = datetime.now().strftime("%Y.%m.%d-%H.%M.%S")
         self.progress_transformer.save_checkpoint(
-            f"checkpoints/prg_t-{datetime_str}-s-{step}-b{config.train_loader_config.batch_size}.eqx"
+            f"{save_dir}/prg_t-{datetime_str}-s-{step}-b{config.train_loader_config.batch_size}.eqx"
         )
         self.stage_transformer.save_checkpoint(
-            f"checkpoints/stg_t-{datetime_str}-s-{step}-b{config.train_loader_config.batch_size}.eqx"
+            f"{save_dir}/stg_t-{datetime_str}-s-{step}-b{config.train_loader_config.batch_size}.eqx"
         )
