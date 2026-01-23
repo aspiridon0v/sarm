@@ -87,9 +87,9 @@ class LoggingConfig:
 
 @dataclass
 class SarmConfig:
-    general_config: GeneralConfig = GeneralConfig()
-    model_config: ModelConfig = ModelConfig()
-    optimizer_config: OptimizerConfig = OptimizerConfig()
-    train_config: TrainConfig = TrainConfig()
-    train_loader_config: TrainLoaderConfig = TrainLoaderConfig()
-    logging_config: LoggingConfig = LoggingConfig()
+    general_config: GeneralConfig = field(default_factory=GeneralConfig)
+    model_config: ModelConfig = field(default_factory=ModelConfig)
+    optimizer_config: OptimizerConfig = field(default_factory=OptimizerConfig)
+    train_config: TrainConfig = field(default_factory=TrainConfig)
+    train_loader_config: TrainLoaderConfig = field(default_factory=TrainLoaderConfig)
+    logging_config: LoggingConfig = field(default_factory=LoggingConfig)
